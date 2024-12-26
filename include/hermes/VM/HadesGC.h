@@ -489,6 +489,16 @@ class HadesGC final : public GCBase {
       const override;
   bool needsWriteBarrier(const GCPointerBase *loc, GCCell *value)
       const override;
+  bool needsWriteBarrierInCtor(const GCHermesValue *loc, HermesValue value)
+      const override;
+  bool needsWriteBarrierInCtor(
+      const GCSmallHermesValue *loc,
+      SmallHermesValue value) const override;
+  bool needsWriteBarrierForLargeObj(const GCHermesValue *loc, HermesValue value)
+      const override;
+  bool needsWriteBarrierForLargeObj(
+      const GCSmallHermesValue *loc,
+      SmallHermesValue value) const override;
   /// \}
 #endif
 

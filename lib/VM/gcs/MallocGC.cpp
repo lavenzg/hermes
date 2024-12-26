@@ -515,13 +515,33 @@ bool MallocGC::needsWriteBarrier(const GCHermesValue *loc, HermesValue value)
     const {
   return false;
 }
+bool MallocGC::needsWriteBarrierInCtor(
+    const GCHermesValue *loc,
+    HermesValue value) const {
+  return false;
+}
 bool MallocGC::needsWriteBarrier(
+    const GCSmallHermesValue *loc,
+    SmallHermesValue value) const {
+  return false;
+}
+bool MallocGC::needsWriteBarrierInCtor(
     const GCSmallHermesValue *loc,
     SmallHermesValue value) const {
   return false;
 }
 bool MallocGC::needsWriteBarrier(const GCPointerBase *loc, GCCell *value)
     const {
+  return false;
+}
+bool MallocGC::needsWriteBarrierForLargeObj(
+    const GCHermesValue *loc,
+    HermesValue value) const {
+  return false;
+}
+bool MallocGC::needsWriteBarrierForLargeObj(
+    const GCSmallHermesValue *loc,
+    SmallHermesValue value) const {
   return false;
 }
 #endif

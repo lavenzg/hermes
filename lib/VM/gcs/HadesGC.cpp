@@ -2289,6 +2289,17 @@ bool HadesGC::needsWriteBarrier(const GCHermesValue *loc, HermesValue value)
     return true;
   return false;
 }
+bool HadesGC::needsWriteBarrierInCtor(
+    const GCHermesValue *loc,
+    HermesValue value) const {
+  // Values in the YG never need a barrier.
+  if (inYoungGen(loc))
+    return false;
+  // If the new value is a pointer, a relocation barrier is needed.
+  if (value.isPointer())
+    return true;
+  return false;
+}
 bool HadesGC::needsWriteBarrier(
     const GCSmallHermesValue *loc,
     SmallHermesValue value) const {
@@ -2299,6 +2310,41 @@ bool HadesGC::needsWriteBarrier(
   if (loc->isPointer() || loc->isSymbol())
     return true;
   // If the new value is a pointer, a relocation barrier is needed.
+  if (value.isPointer())
+    return true;
+  return false;
+}
+bool HadesGC::needsWriteBarrierInCtor(
+    const GCSmallHermesValue *loc,
+    SmallHermesValue value) const {
+  // Values in the YG never need a barrier.
+  if (inYoungGen(loc))
+    return false;
+  // If the new value is a pointer, a relocation barrier is needed.
+  if (value.isPointer())
+    return true;
+  return false;
+}
+bool HadesGC::needsWriteBarrierForLargeObj(
+    const GCHermesValue *loc,
+    HermesValue value) const {
+  // For large allocation, we don't allow skipping barriers if the pointer lives
+  // in YG. We may revisit this if there is a case that we really want to skip
+  // barriers (by ensuring that the owning object always lives in YG).
+  if (loc->isPointer() || loc->isSymbol())
+    return true;
+  if (value.isPointer())
+    return true;
+  return false;
+}
+bool HadesGC::needsWriteBarrierForLargeObj(
+    const GCSmallHermesValue *loc,
+    SmallHermesValue value) const {
+  // For large allocation, we don't allow skipping barriers if the pointer lives
+  // in YG. We may revisit this if there is a case that we really want to skip
+  // barriers (by ensuring that the owning object always lives in YG).
+  if (loc->isPointer() || loc->isSymbol())
+    return true;
   if (value.isPointer())
     return true;
   return false;
