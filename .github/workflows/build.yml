@@ -193,12 +193,13 @@ jobs:
       working-directory: test/ApplePlatformsIntegrationTestApp
     - name: Test iPhone application
       run: |-
-        # Xcode 15 uses iOS 17 for simulator, and only iPhone 14/15 can work by
-        # default, so use the oldest working model here.
+        # macos-14 installs simulators for iPhone 15/16, so use the oldest model
+        # here:
+        # https://github.com/actions/runner-images/blob/main/images/macos/macos-14-arm64-Readme.md
         xcodebuild test \
           -workspace ApplePlatformsIntegrationTests.xcworkspace \
           -configuration Debug \
-          -destination 'platform=iOS Simulator,name=iPhone 14' \
+          -destination 'platform=iOS Simulator,name=iPhone 15' \
           -scheme ApplePlatformsIntegrationMobileTests
       working-directory: test/ApplePlatformsIntegrationTestApp
     - name: Test Apple Vision application
