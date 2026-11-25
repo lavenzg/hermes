@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -318,6 +319,8 @@ TEST_F(SharedRootScanTest, Scan_SkipsARuntimeThatLeavesWhileItsMapIsBusy) {
 
   EXPECT_TRUE(scannedWhileBusy)
       << "the scan kept trying the map of a runtime that had left";
+  EXPECT_EQ(std::vector<SharedGCCell *>{cell}, gc.barrierWorklistSlow())
+      << "the runtime that left dropped its keys";
   gc.abortCycle();
 }
 
@@ -348,6 +351,44 @@ TEST_F(SharedRootScanTest, Scan_RacesAttachAndDetach) {
   // The resident runtime's key is found regardless of the churn around it.
   EXPECT_TRUE(SharedGC::isMarked(cell));
   gc.abortCycle();
+}
+
+TEST_F(SharedRootScanTest, Detach_CopiesKeysWhileCyclesRun) {
+  // For TSan. A runtime whose map is not empty keeps detaching while whole
+  // cycles run, so its keys reach the barrier worklist from another thread
+  // while the collector drains it. A resident registration for the same
+  // runtime keeps the cell a root, so every copied key names a live cell and
+  // the cell survives every cycle.
+  auto *cell = array();
+  box(b, cell);
+  SharedMutator resident{gc, b};
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint32_t> detaches{0};
+  std::thread churn([&] {
+    while (!stop.load(std::memory_order_acquire)) {
+      SharedMutator transient{gc, b};
+      (void)transient;
+      detaches.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  // Not a fixed count alone: that can finish before the churn thread is
+  // scheduled, leaving nothing for TSan to see.
+  size_t survivors = 1;
+  for (uint32_t i = 0; survivors == 1 &&
+       (i < 200 || detaches.load(std::memory_order_relaxed) < 1000);
+       ++i) {
+    gc.collect();
+    survivors = gc.liveCellCountSlow();
+  }
+  // Join before asserting: returning would leave the thread running.
+  stop.store(true, std::memory_order_release);
+  churn.join();
+
+  EXPECT_EQ(1u, survivors) << "the resident runtime's cell was swept";
+  EXPECT_GT(detaches.load(), 0u);
+  EXPECT_EQ(1u, gc.mutatorCountSlow());
 }
 
 TEST_F(SharedRootScanTest, Detach_WaitsForACopyOfItsKeysToFinish) {
@@ -401,6 +442,8 @@ TEST_F(SharedRootScanTest, Detach_WaitsForACopyOfItsKeysToFinish) {
   EXPECT_FALSE(leftWhileCopying)
       << "a runtime finished leaving while its keys were being copied";
   EXPECT_TRUE(left.load(std::memory_order_acquire));
+  EXPECT_EQ(std::vector<SharedGCCell *>{cell}, gc.barrierWorklistSlow())
+      << "the runtime that left dropped its keys";
   gc.abortCycle();
 }
 

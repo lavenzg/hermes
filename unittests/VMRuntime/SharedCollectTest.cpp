@@ -136,6 +136,37 @@ TEST_F(SharedCollectTest, Collect_WaitsForABarrierInFlight) {
   EXPECT_EQ(1u, child->length());
 }
 
+TEST_F(
+    SharedCollectTest,
+    Collect_KeepsTheKeysOfARuntimeThatLeavesDuringTheWait) {
+  // collect() on its own thread, held in its wait by B's window. Meanwhile A
+  // stores `cell` into a cell born this cycle, which is never traced, B boxes
+  // that cell, and A leaves. Only A's keys named `cell`.
+  auto mutatorA = std::make_unique<SharedMutator>(gc, a);
+  SharedMutator mutatorB{gc, b};
+  auto *cell = array();
+  box(a, cell);
+
+  mutatorB.enterBarrier();
+  const uint32_t before = gc.cycleSeq();
+  std::thread collector([&] { gc.collect(); });
+  while (gc.cycleSeq() == before)
+    std::this_thread::yield();
+  // Marking is on, and collect() cannot get past its wait until B's window
+  // closes.
+  auto *holder = array();
+  holder->initField(0, SharedValue::encodePointer(cell));
+  box(b, holder);
+  mutatorA.reset();
+  mutatorB.exitBarrier();
+  // Nothing may return before the join, or the thread is left running.
+  collector.join();
+
+  ASSERT_EQ(2u, gc.liveCellCountSlow()) << "cell was swept";
+  EXPECT_EQ(cell, holder->at(0).getPointer());
+  EXPECT_EQ(1u, cell->length());
+}
+
 TEST_F(SharedCollectTest, Collect_WaitsForAWindowOpenedDuringTheFirstWait) {
   // B's window holds collect() in its first wait. A, which the first pass
   // found idle, opens a window during that wait and records a cell only after

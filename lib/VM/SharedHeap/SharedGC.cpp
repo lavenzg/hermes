@@ -711,20 +711,24 @@ void SharedGC::registerMutator(SharedMutator *mutator) {
 }
 
 void SharedGC::unregisterMutator(SharedMutator *mutator) {
-  unlinkMutator(mutator);
+  // Copied before barrierMtx_ is taken, so a spill waits at most for
+  // unlinkMutator's append of the copy, not for a walk of the map. That is
+  // before marking can be known to be on, so the copy is made either way. No
+  // map lock: nothing inserts or erases while the runtime unregisters, and
+  // the root scan only reads.
+  std::vector<SharedGCCell *> keys;
+  mutator->runtime().appendSharedRootKeysUnlocked(keys);
+  unlinkMutator(mutator, keys);
   // A root scan that found this runtime registered may still be copying its
   // keys, holding the map lock. Taking that lock waits for the copy, so the
   // map outlives it; once unlinked, no later scan can find the runtime.
   std::lock_guard<std::mutex> lk(mutator->runtime().sharedObjectBoxesLock());
 }
 
-void SharedGC::unlinkMutator(SharedMutator *mutator) {
+void SharedGC::unlinkMutator(
+    SharedMutator *mutator,
+    llvh::ArrayRef<SharedGCCell *> keys) {
   std::lock_guard<std::mutex> lk(barrierMtx_);
-  // Flush before dropping the registration. What is still in the ring are SATB
-  // entries, and dropping them can leave a cell unmarked that another runtime
-  // still reaches -- sweep would then free it.
-  if (markState_)
-    mutator->ring_.drainInto(markState_->barrierWorklist, cycleSeq());
   auto it = std::find(mutators_.begin(), mutators_.end(), mutator);
   assert(it != mutators_.end() && "unregistering an unknown mutator");
   // Checked in release too. A double unregister, or a SharedMutator built
@@ -732,6 +736,28 @@ void SharedGC::unlinkMutator(SharedMutator *mutator) {
   // shrink -- heap corruption in exactly the build with no assert to catch it.
   if (LLVM_UNLIKELY(it == mutators_.end()))
     return;
+  if (markState_) {
+    // Read once, under the lock that turning marking off takes, so a value
+    // read odd here is still current at the unlink below.
+    const uint32_t seq = cycleSeq();
+    // Flush before dropping the registration. What is still in the ring are
+    // SATB entries, and dropping them can leave a cell unmarked that another
+    // runtime still reaches -- sweep would then free it.
+    mutator->ring_.drainInto(markState_->barrierWorklist, seq);
+    // While marking is on, the keys go too. The root scan reads only
+    // registered runtimes and may not have reached this one, and a cell that
+    // only these keys name may by now sit in a cell born this cycle, which is
+    // never traced. Appended under the same lock as the unlink, so the
+    // collector finds either this runtime, in the root scan, or its keys, in
+    // the barrier worklist that certification drains. With marking off there
+    // is nothing to append: before it turns on, this runtime cannot have
+    // stored into a cell born in the cycle, and after certification every
+    // cell its keys name is already marked -- by the root scan, at birth or
+    // by a push -- and endCycle requires an empty worklist.
+    if (seq % 2 == 1)
+      markState_->barrierWorklist.insert(
+          markState_->barrierWorklist.end(), keys.begin(), keys.end());
+  }
   // Order does not matter: no walk depends on it.
   *it = mutators_.back();
   mutators_.pop_back();

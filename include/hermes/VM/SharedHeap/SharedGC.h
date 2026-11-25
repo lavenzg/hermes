@@ -386,9 +386,12 @@ class SharedGC {
   std::vector<SharedGCCell *> copyRootKeys(
       const std::function<void(const Runtime &)> *beforeCopy = nullptr) const;
 
-  /// unregisterMutator's part under barrierMtx_: flush the ring and drop the
-  /// registration.
-  void unlinkMutator(SharedMutator *mutator);
+  /// unregisterMutator's part under barrierMtx_: flush the ring, append
+  /// \p keys, the runtime's box-map keys, to the barrier worklist if marking
+  /// is on, and drop the registration.
+  void unlinkMutator(
+      SharedMutator *mutator,
+      llvh::ArrayRef<SharedGCCell *> keys);
 
   /// Note every registered runtime that is inside a barrier window now, for
   /// pollInFlightBarriers to wait for.
@@ -409,7 +412,8 @@ class SharedGC {
     /// number of cells in the shared heap.
     std::stack<SharedGCCell *, std::vector<SharedGCCell *>> localWorklist;
 
-    /// Cells runtimes have spilled out of their rings, waiting to be traced.
+    /// Cells runtimes have spilled out of their rings, and the box-map keys of
+    /// runtimes that unregistered while marking was on, waiting to be traced.
     /// Unlike localWorklist this is written by mutator threads, so every
     /// access holds barrierMtx_.
     std::vector<SharedGCCell *> barrierWorklist;
@@ -776,8 +780,12 @@ class SharedGC {
   }
 
   /// Add and remove a runtime's barrier state. SharedMutator's constructor and
-  /// destructor are the only callers. Unregistering flushes the ring first,
-  /// and returns only once no root scan is copying the runtime's keys.
+  /// destructor are the only callers. Unregistering first copies the
+  /// runtime's box-map keys, taking no lock, so nothing may insert into or
+  /// erase from the map meanwhile. It then flushes the ring and, while marking
+  /// is on, appends the keys to the barrier worklist, since the root scan
+  /// cannot read them once the runtime is unlinked. It returns only once no
+  /// root scan is copying the keys.
   void registerMutator(SharedMutator *mutator);
   void unregisterMutator(SharedMutator *mutator);
 

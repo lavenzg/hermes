@@ -37,8 +37,8 @@ class SharedMutator {
   /// the collector reaches that runtime's box map, which is its root set. It
   /// is not dereferenced here, and must outlive this.
   SharedMutator(SharedGC &gc, Runtime &runtime);
-  /// Unregisters, which takes the runtime's map lock, so the runtime must still
-  /// be alive.
+  /// Unregisters, which reads the runtime's box map and takes its lock, so the
+  /// runtime must still be alive.
   ~SharedMutator();
 
   SharedMutator(const SharedMutator &) = delete;
@@ -180,11 +180,11 @@ inline void SharedValue::set(SharedValue v, SharedMutator &mutator) {
   // It also puts this store in one total order with every test of the marking
   // flag and with the barrier's seq_cst pre-read. Suppose this runtime then
   // gives up its own key for the cell it stores here, after a test that saw
-  // marking off. A barrier in another runtime that sees marking on must still
-  // pre-read this value: if it read an older one, it would record that,
-  // overwrite this one unrecorded, and the cell could be freed while some
-  // runtime still reaches it. Release and acquire alone allow that stale read;
-  // the total order rules it out.
+  // marking off: a prune, or a detach. A barrier in another runtime that sees
+  // marking on must still pre-read this value: if it read an older one, it
+  // would record that, overwrite this one unrecorded, and the cell could be
+  // freed while some runtime still reaches it. Release and acquire alone allow
+  // that stale read; the total order rules it out.
   raw_.store(v.raw_.load(std::memory_order_relaxed), std::memory_order_seq_cst);
   mutator.exitBarrier();
 }

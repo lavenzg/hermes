@@ -841,6 +841,28 @@ void Runtime::markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
 
 #ifdef HERMES_ENABLE_SHARED_HEAP
 void Runtime::pruneSharedObjectBoxes() {
+  // No SharedMutator means no ring: the runtime was never attached, or it has
+  // detached, and no lookup runs after that.
+  if (sharedMutator_) {
+    // While marking is on, a dead box does not make its key safe to drop:
+    // while the box was alive, this runtime may have stored the cell into a
+    // cell born this cycle, which is never traced. So each dead key is pushed
+    // first, and outside the map lock: a push can spill, which takes the
+    // barrier mutex, and the root scan takes that mutex before a map lock. A
+    // root scan that misses an erased key takes the map lock after the erase,
+    // so it also comes after these pushes.
+    sharedMutator_->enterBarrier();
+    const uint32_t seq = sharedGC_->cycleSeq();
+    if (seq % 2 == 1) {
+      // No lock: this thread is the map's only writer. Nothing from here to
+      // the erase can run a local GC, so the erase removes exactly the keys
+      // pushed here.
+      for (const auto &entry : sharedObjectBoxes_)
+        if (!entry.second.getNoBarrierUnsafe())
+          sharedMutator_->push(entry.first, seq);
+    }
+    sharedMutator_->exitBarrier();
+  }
   // Erasing moves buckets, so the collector must not be walking the keys.
   std::lock_guard<std::mutex> lk(sharedObjectBoxesMtx_);
   // Erasing during iteration is safe on DenseMap.

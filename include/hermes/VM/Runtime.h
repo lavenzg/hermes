@@ -555,6 +555,10 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// Never materialises. Creating a box allocates, and the order in which that
   /// interleaves with a shared collection is the allocation protocol's problem,
   /// not the map's.
+  ///
+  /// \pre neither the shared heap's allocation lock nor this runtime's map
+  ///   lock is held. The lookup may prune, and while marking is on the prune
+  ///   pushes, which can spill and so take the shared heap's barrier mutex.
   BoxedSharedObject *findBoxForSharedCell(SharedGCCell *cell);
 
   /// Run pruneSharedObjectBoxes if a local GC has found a box dead since the
@@ -1392,9 +1396,12 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   inline void initStackWithZeroes(PinnedHermesValue *base, uint32_t count);
 
 #ifdef HERMES_ENABLE_SHARED_HEAP
-  /// Drop entries whose box has been collected.
+  /// Drop entries whose box has been collected, first pushing each of their
+  /// keys onto this runtime's barrier ring if marking is on.
   /// Deferred out of the weak-root pass on purpose; see the comment on
   /// sharedObjectBoxesNeedPrune_.
+  /// \pre neither the shared heap's allocation lock nor this map's lock is
+  ///   held.
   void pruneSharedObjectBoxes();
 #endif
 

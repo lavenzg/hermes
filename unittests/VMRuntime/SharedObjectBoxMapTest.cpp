@@ -106,11 +106,11 @@ TEST_F(SharedObjectBoxMapTest, DeadEntries_ArePrunedOnTheNextAccess) {
 
 TEST_F(SharedObjectBoxMapTest, Insert_DoesNotPrune) {
   // Pruning is a lookup-only side effect. An insert runs under the shared
-  // heap's allocation lock, and the prune is planned to push each key it
-  // erases into the barrier ring, which can reach the spill path and so the
-  // barrier mutex -- the reverse of the order a collector takes them in. The
-  // debug assert on the way in must not reach it either, which is the only
-  // way this could creep back.
+  // heap's allocation lock, and while marking is on the prune pushes each key
+  // it erases into the barrier ring, which can reach the spill path and so the
+  // barrier mutex -- the reverse of the lock order, which puts the barrier
+  // mutex first. The debug assert on the way in must not reach it either,
+  // which is the only way this could creep back.
   auto *dead = fakeCell(0x8000);
   auto *fresh = fakeCell(0x9000);
 
