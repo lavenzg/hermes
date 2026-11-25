@@ -356,6 +356,31 @@ class SharedGC {
 
   class MarkAcceptor;
 
+  /// markRuntimeRoots, passing \p beforeCopy to copyRootKeys.
+  size_t markRuntimeRootsImpl(
+      const std::function<void(const Runtime &)> *beforeCopy);
+
+  /// \return the box-map keys of every runtime registered when the call
+  ///   starts and still registered when its turn comes, each map copied under
+  ///   its own lock.
+  /// \param beforeCopy if not null, called for each runtime just before its
+  ///   keys are copied, with its map lock held and barrierMtx_ not. Only
+  ///   tests pass one.
+  ///
+  /// barrierMtx_, which a store barrier takes when its ring fills, is held
+  /// only to snapshot the registry and, for each runtime, to check that it is
+  /// still registered and to try its map lock: never across a copy, and never
+  /// while waiting for a busy map, which is retried after a yield instead.
+  /// The map lock, taken while the runtime is registered and held across the
+  /// copy, keeps the map alive, since unregisterMutator takes it after the
+  /// unlink.
+  std::vector<SharedGCCell *> copyRootKeys(
+      const std::function<void(const Runtime &)> *beforeCopy = nullptr) const;
+
+  /// unregisterMutator's part under barrierMtx_: flush the ring and drop the
+  /// registration.
+  void unlinkMutator(SharedMutator *mutator);
+
   /// State that exists only while a marking cycle is running.
   ///
   /// A mutator cannot name this: markState_ is private and has no accessor, so
@@ -575,6 +600,32 @@ class SharedGC {
   ///   segment.
   void markRoots(llvh::ArrayRef<SharedGCCell *> roots);
 
+  /// Mark every attached runtime's shared roots -- the keys of its box map,
+  /// which name every shared cell it can reach, since a runtime boxes every
+  /// shared cell it allocates or acquires.
+  /// \return the number of keys scanned, live or already marked.
+  ///
+  /// The keys are copied out first, by copyRootKeys, and marked after it has
+  /// dropped every lock, so no lock is held across a trace.
+  ///
+  /// Safe to call more than once in a cycle, and cheap to: marking is
+  /// idempotent, so a later scan only picks up runtimes that have boxed
+  /// something since.
+  ///
+  /// \pre a cycle is in progress, on the thread that began tracing it.
+  size_t markRuntimeRoots() {
+    return markRuntimeRootsImpl(nullptr);
+  }
+
+#ifdef UNIT_TEST
+  /// markRuntimeRoots, calling \p beforeCopy for each runtime just before its
+  /// keys are copied, with its map lock held and barrierMtx_ not.
+  size_t markRuntimeRoots(
+      const std::function<void(const Runtime &)> &beforeCopy) {
+    return markRuntimeRootsImpl(&beforeCopy);
+  }
+#endif
+
   /// Trace until the mark worklist is empty.
   ///
   /// Unbudgeted, unlike HadesGC::incrementalMark: markLimit bounds how long
@@ -594,7 +645,8 @@ class SharedGC {
   }
 
   /// Add and remove a runtime's barrier state. SharedMutator's constructor and
-  /// destructor are the only callers. Unregistering flushes the ring first.
+  /// destructor are the only callers. Unregistering flushes the ring first,
+  /// and returns only once no root scan is copying the runtime's keys.
   void registerMutator(SharedMutator *mutator);
   void unregisterMutator(SharedMutator *mutator);
 

@@ -8,12 +8,14 @@
 #include "hermes/VM/SharedHeap/SharedGC.h"
 #include "hermes/Support/Compiler.h"
 #include "hermes/Support/OSCompat.h"
+#include "hermes/VM/Runtime.h"
 #include "hermes/VM/SharedHeap/SharedGC-inline.h"
 #include "hermes/VM/SharedHeap/SharedMutator.h"
 
 #include <iterator>
 #include <limits>
 #include <new>
+#include <thread>
 
 namespace hermes {
 namespace vm {
@@ -433,6 +435,63 @@ void SharedGC::markRoots(llvh::ArrayRef<SharedGCCell *> roots) {
     acceptor.accept(root);
 }
 
+std::vector<SharedGCCell *> SharedGC::copyRootKeys(
+    const std::function<void(const Runtime &)> *beforeCopy) const {
+  std::vector<SharedMutator *> registered;
+  {
+    std::lock_guard<std::mutex> lk(barrierMtx_);
+    registered = mutators_;
+  }
+
+  std::vector<SharedGCCell *> keys;
+  std::vector<SharedGCCell *> mapKeys;
+  for (SharedMutator *mutator : registered) {
+    const Runtime *runtime = nullptr;
+    // Outside the loop, so that it is still held for the copy.
+    std::unique_lock<std::mutex> mapLock;
+    while (true) {
+      std::unique_lock<std::mutex> lk(barrierMtx_);
+      // Unregistered since the snapshot: its keys are no longer roots, and
+      // its map may be gone.
+      if (std::find(mutators_.begin(), mutators_.end(), mutator) ==
+          mutators_.end())
+        break;
+      mapLock = std::unique_lock<std::mutex>(
+          mutator->runtime().sharedObjectBoxesLock(), std::try_to_lock);
+      if (mapLock.owns_lock()) {
+        runtime = &mutator->runtime();
+        break;
+      }
+      // Busy. Waiting for the map here would hold up every spill for as long
+      // as the map is held; waiting without barrierMtx_ would let the runtime
+      // unregister, and its map go, before the wait ends.
+      lk.unlock();
+      std::this_thread::yield();
+    }
+    if (!runtime)
+      continue;
+    if (beforeCopy)
+      (*beforeCopy)(*runtime);
+    // Under the map lock alone, and into a vector of its own, so the hold is
+    // a copy of this map and nothing more: an insert waits for it holding
+    // mtx_.
+    mapKeys.clear();
+    runtime->appendSharedRootKeysUnlocked(mapKeys);
+    mapLock.unlock();
+    keys.insert(keys.end(), mapKeys.begin(), mapKeys.end());
+  }
+  return keys;
+}
+
+size_t SharedGC::markRuntimeRootsImpl(
+    const std::function<void(const Runtime &)> *beforeCopy) {
+  const std::vector<SharedGCCell *> keys = copyRootKeys(beforeCopy);
+  // No lock is held. accept() writes the collector-local worklist, which no
+  // mutator touches.
+  markRoots(keys);
+  return keys.size();
+}
+
 size_t SharedGC::drainMarkWorklist() {
   assert(markState_ && "no marking cycle in progress");
   MarkAcceptor acceptor(*this);
@@ -459,6 +518,14 @@ void SharedGC::registerMutator(SharedMutator *mutator) {
 }
 
 void SharedGC::unregisterMutator(SharedMutator *mutator) {
+  unlinkMutator(mutator);
+  // A root scan that found this runtime registered may still be copying its
+  // keys, holding the map lock. Taking that lock waits for the copy, so the
+  // map outlives it; once unlinked, no later scan can find the runtime.
+  std::lock_guard<std::mutex> lk(mutator->runtime().sharedObjectBoxesLock());
+}
+
+void SharedGC::unlinkMutator(SharedMutator *mutator) {
   std::lock_guard<std::mutex> lk(barrierMtx_);
   // Flush before dropping the registration. What is still in the ring are SATB
   // entries, and dropping them can leave a cell unmarked that another runtime

@@ -33,7 +33,8 @@ class SharedMutator {
   /// the collector reaches that runtime's box map, which is its root set. It
   /// is not dereferenced here, and must outlive this.
   SharedMutator(SharedGC &gc, Runtime &runtime);
-  /// Unregisters.
+  /// Unregisters, which takes the runtime's map lock, so the runtime must still
+  /// be alive.
   ~SharedMutator();
 
   SharedMutator(const SharedMutator &) = delete;

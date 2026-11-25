@@ -92,6 +92,7 @@ if(HERMES_ENABLE_SHARED_HEAP)
     SharedMarkAcceptorTest.cpp
     SharedMutatorTest.cpp
     SharedObjectBoxMapTest.cpp
+    SharedRootScanTest.cpp
     SharedSlotVisitorTest.cpp
     )
 endif()

@@ -556,8 +556,23 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// not been pruned, which over-retains for one cycle and never
   /// under-retains.
   ///
-  /// Called on the collector's thread, not this runtime's.
+  /// Reads only keys, never the boxes, and takes the map lock, so it can run
+  /// on any thread.
   void appendSharedRootKeys(std::vector<SharedGCCell *> &out) const;
+
+  /// appendSharedRootKeys without taking the map lock.
+  /// \pre nothing inserts into or erases from the map during the call: the
+  ///   caller holds sharedObjectBoxesLock(), or is this runtime's own thread,
+  ///   the only one that inserts or erases.
+  void appendSharedRootKeysUnlocked(std::vector<SharedGCCell *> &out) const;
+
+  /// sharedObjectBoxesMtx_, for the root scan. It tries the lock rather than
+  /// waiting for it, and holds it across the copy after dropping the shared
+  /// heap's barrier mutex: SharedGC::unregisterMutator takes it after
+  /// unlinking this runtime, so the map outlives the copy.
+  std::mutex &sharedObjectBoxesLock() const {
+    return sharedObjectBoxesMtx_;
+  }
 
 #ifdef UNIT_TEST
   /// \return the number of entries, live or dead, in the box map.

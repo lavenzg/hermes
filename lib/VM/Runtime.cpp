@@ -871,6 +871,11 @@ void Runtime::setBoxForSharedCell(
 
 void Runtime::appendSharedRootKeys(std::vector<SharedGCCell *> &out) const {
   std::lock_guard<std::mutex> lk(sharedObjectBoxesMtx_);
+  appendSharedRootKeysUnlocked(out);
+}
+
+void Runtime::appendSharedRootKeysUnlocked(
+    std::vector<SharedGCCell *> &out) const {
   out.reserve(out.size() + sharedObjectBoxes_.size());
   for (const auto &entry : sharedObjectBoxes_)
     out.push_back(entry.first);
