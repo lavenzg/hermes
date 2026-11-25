@@ -38,6 +38,9 @@
 #include "hermes/VM/PropertyDescriptor.h"
 #include "hermes/VM/RegExpMatch.h"
 #include "hermes/VM/RuntimeModule.h"
+#ifdef HERMES_ENABLE_SHARED_HEAP
+#include "hermes/VM/SharedHeap/SharedGCCell.h"
+#endif
 #include "hermes/VM/StackFrame.h"
 #include "hermes/VM/StackTracesTree-NoRuntime.h"
 #include "hermes/VM/SymbolRegistry.h"
@@ -88,6 +91,7 @@ struct CapturedRange;
 namespace vm {
 
 // External forward declarations.
+class BoxedSharedObject;
 class CodeBlock;
 class Environment;
 class Interpreter;
@@ -522,6 +526,27 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// ECMAScript executions completes." This method clears all kept WeakRefs and
   /// allows their targets to be eligible for garbage collection again.
   void clearKeptObjects();
+
+#ifdef HERMES_ENABLE_SHARED_HEAP
+  /// \return this runtime's box for \p cell, or null if it has none -- either
+  /// it never made one, or the box has since been collected.
+  ///
+  /// Never materialises. Creating a box allocates, and the order in which that
+  /// interleaves with a shared collection is the allocation protocol's problem,
+  /// not the map's.
+  BoxedSharedObject *findBoxForSharedCell(SharedGCCell *cell);
+
+  /// Record \p box as this runtime's box for \p cell.
+  /// \pre there is no live box for \p cell.
+  void setBoxForSharedCell(SharedGCCell *cell, Handle<BoxedSharedObject> box);
+
+#ifdef UNIT_TEST
+  /// \return the number of entries, live or dead, in the box map.
+  size_t sharedObjectBoxCountSlow() const {
+    return sharedObjectBoxes_.size();
+  }
+#endif
+#endif // HERMES_ENABLE_SHARED_HEAP
 
   /// Add \p registry to the list of finalizationRegistries_.
   void addFinalizationRegistry(JSFinalizationRegistry *registry);
@@ -1304,6 +1329,13 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// \param count the number of HermesValues to initialize.
   inline void initStackWithZeroes(PinnedHermesValue *base, uint32_t count);
 
+#ifdef HERMES_ENABLE_SHARED_HEAP
+  /// Drop entries whose box has been collected.
+  /// Deferred out of the weak-root pass on purpose; see the comment on
+  /// sharedObjectBoxesNeedPrune_.
+  void pruneSharedObjectBoxes();
+#endif
+
  private:
   GCBase::GCCallbacksWrapper<Runtime> gcCallbacksWrapper_;
   GC heap_;
@@ -1415,6 +1447,26 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// elements are removed, the rest alive JSFinalizationRegistry are iterated
   /// and its `cleanup()` method is called.
   std::vector<WeakRoot<JSFinalizationRegistry>> finalizationRegistries_{};
+
+#ifdef HERMES_ENABLE_SHARED_HEAP
+  /// This runtime's boxes for shared cells, keyed by the cell.
+  /// This serves two purposes:
+  /// 1. Deduplication. Strict equality on two objects is decided by raw pointer
+  /// comparison in places. It's expensive to check the object cell kind and
+  /// unbox them in equality test.
+  /// 2. Entries in this map are a set of roots from this runtime to the shared
+  /// heap. The collector of shared heap starts by scanning this map of every
+  /// runtime.
+  llvh::DenseMap<SharedGCCell *, WeakRoot<BoxedSharedObject>>
+      sharedObjectBoxes_{};
+
+  /// Set when a weak-root pass nulled at least one entry above. The sweep
+  /// happens on the next lookup rather than in the pass itself. This
+  /// separates the shared heap related logic from the local heap marking. The
+  /// cost of erasing null entries is only added to lookup of this map, which
+  /// is out of normal JS execution.
+  bool sharedObjectBoxesNeedPrune_{false};
+#endif // HERMES_ENABLE_SHARED_HEAP
 
   /// @name Private VM State
   /// @{

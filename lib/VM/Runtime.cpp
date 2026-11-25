@@ -796,6 +796,13 @@ void Runtime::markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
   for (auto &registry : finalizationRegistries_) {
     acceptor.acceptWeak(registry);
   }
+#ifdef HERMES_ENABLE_SHARED_HEAP
+  for (auto &entry : sharedObjectBoxes_) {
+    acceptor.acceptWeak(entry.second);
+    if (!entry.second.getNoBarrierUnsafe())
+      sharedObjectBoxesNeedPrune_ = true;
+  }
+#endif
   for (auto &rm : runtimeModuleList_)
     rm.markWeakRoots(acceptor, markLongLived);
   for (SHUnit *unit : units)
@@ -805,6 +812,55 @@ void Runtime::markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
     fn(&getHeap(), acceptor);
   acceptor.endRootSection();
 }
+
+#ifdef HERMES_ENABLE_SHARED_HEAP
+void Runtime::pruneSharedObjectBoxes() {
+  // Erasing during iteration is safe on DenseMap.
+  for (auto it = sharedObjectBoxes_.begin(), e = sharedObjectBoxes_.end();
+       it != e;
+       ++it)
+    if (!it->second.getNoBarrierUnsafe())
+      sharedObjectBoxes_.erase(it);
+  sharedObjectBoxesNeedPrune_ = false;
+}
+
+BoxedSharedObject *Runtime::findBoxForSharedCell(SharedGCCell *cell) {
+  // The setter asserts this too. A null cell is a legal DenseMap key, so
+  // without the assert an unbound box's getSharedCell() passed in here reads
+  // as a clean miss and the caller boxes the cell a second time.
+  assert(cell && "a box stands for a cell");
+  if (LLVM_UNLIKELY(sharedObjectBoxesNeedPrune_))
+    pruneSharedObjectBoxes();
+  auto it = sharedObjectBoxes_.find(cell);
+  if (it == sharedObjectBoxes_.end())
+    return nullptr;
+  // This performs a read barrier so that the local GC will not collect the box
+  // until next cycle.
+  return it->second.get(*this, getHeap());
+}
+
+void Runtime::setBoxForSharedCell(
+    SharedGCCell *cell,
+    Handle<BoxedSharedObject> box) {
+  assert(cell && "a box stands for a cell");
+  // BoxedSharedObject::create's cell argument defaults to null, so an unbound
+  // box is easy to produce and, once published here, is indistinguishable from
+  // a correctly bound one at every later unbox.
+  assert(*box && "a null box is not a box");
+  assert(
+      box->getSharedCell() == cell &&
+      "the box must already stand for the cell it is filed under");
+#ifndef NDEBUG
+  // Deliberately not findBoxForSharedCell: an assert must not have side
+  // effects, and that one prunes and fires WeakRoot's read barrier.
+  auto it = sharedObjectBoxes_.find(cell);
+  assert(
+      (it == sharedObjectBoxes_.end() || !it->second.getNoBarrierUnsafe()) &&
+      "a second box for one cell breaks strict equality on it");
+#endif
+  sharedObjectBoxes_[cell].set(*this, *box);
+}
+#endif // HERMES_ENABLE_SHARED_HEAP
 
 void Runtime::markDomainRefInRuntimeModules(WeakRootAcceptor &acceptor) {
   std::vector<RuntimeModule *> modulesToDelete;
