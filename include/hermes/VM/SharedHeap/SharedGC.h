@@ -273,6 +273,20 @@ class SharedGC {
     return kPayloadOffset >> LogHeapAlign;
   }
 
+#ifdef HERMES_SLOW_DEBUG
+  /// \return the header of every mapped region, sorted by address.
+  /// \pre mtx_ is held.
+  std::vector<const SegmentHeader *> regionsByAddressLocked() const;
+
+  /// \return whether \p cell is the base of an allocated slot in one of
+  ///   \p regions. Reads only the region headers, never \p cell itself, so it
+  ///   is safe on a pointer to memory that has been freed or unmapped.
+  /// \pre mtx_ is held, and \p regions came from regionsByAddressLocked.
+  static bool isAllocatedLocked(
+      const std::vector<const SegmentHeader *> &regions,
+      const SharedGCCell *cell);
+#endif
+
   /// Allocate a slot of \p cellSize bytes in shared heap and mark it black.
   /// \pre cellSize is aligned to HeapAlign.
   /// \pre mtx_ is held, and stays held until the caller has constructed a cell
@@ -906,6 +920,27 @@ class SharedGC {
   bool markingOn() const {
     return cycleSeq() % 2 == 1;
   }
+
+#ifdef HERMES_SLOW_DEBUG
+  /// \return how many cells reachable from the attached runtimes' box-map keys
+  ///   are unmarked or no longer allocated. Between certification and the
+  ///   sweep that follows, each one counted is a cell the marking protocol
+  ///   lost, since that sweep frees every unmarked cell; endCycle asserts there
+  ///   are none. A sweep also clears every survivor's mark, and abortCycle
+  ///   leaves only a partial trace, so a count taken after either includes
+  ///   reachable cells nothing lost. The check is one-way: a cell may be marked
+  ///   and unreachable, since a cycle keeps what was reachable when it began
+  ///   and everything born during it.
+  /// \pre marking is off and no sweep is running.
+  size_t countReachableUnmarked() const;
+
+  /// \return how many of the attached runtimes' box-map keys name no allocated
+  ///   cell. A key can outlive its cell only if it was published after the
+  ///   root scan with nothing recorded, so collect asserts there are none
+  ///   after its sweep.
+  /// \pre no sweep is running.
+  size_t countDanglingKeys() const;
+#endif
 
 #ifdef UNIT_TEST
   /// \return the registered runtimes.

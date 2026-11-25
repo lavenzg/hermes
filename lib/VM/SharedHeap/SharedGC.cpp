@@ -12,7 +12,10 @@
 #include "hermes/VM/SharedHeap/SharedGC-inline.h"
 #include "hermes/VM/SharedHeap/SharedMutator.h"
 
+#include "llvh/ADT/DenseSet.h"
+
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <new>
@@ -494,7 +497,7 @@ void SharedGC::beginSecondInFlightPass() {
 }
 
 void SharedGC::endCycle() {
-  std::lock_guard<std::mutex> lk(barrierMtx_);
+  std::unique_lock<std::mutex> lk(barrierMtx_);
   assert(markState_ && "no marking cycle in progress");
   // Certification turns marking off inside its own critical section, so
   // marking still being on here means the cycle never certified -- which is
@@ -521,6 +524,13 @@ void SharedGC::endCycle() {
       markState_->barrierWorklist.empty() &&
       "spilled cells were left untraced");
   markState_.reset();
+#ifdef HERMES_SLOW_DEBUG
+  // The check takes barrierMtx_ itself.
+  lk.unlock();
+  const size_t lost = countReachableUnmarked();
+  assert(lost == 0 && "a cell reachable from a box-map key is unmarked");
+  (void)lost;
+#endif
 }
 
 void SharedGC::abortCycle() {
@@ -601,7 +611,13 @@ size_t SharedGC::collect() {
   // what lets endCycle accept the cycle. The sweep stays on this thread, the
   // one that set the marks, so program order makes them visible to it.
   endCycle();
-  return sweep();
+  const size_t released = sweep();
+#ifdef HERMES_SLOW_DEBUG
+  const size_t dangling = countDanglingKeys();
+  assert(dangling == 0 && "a box-map key names a cell the sweep freed");
+  (void)dangling;
+#endif
+  return released;
 }
 
 bool SharedGC::pollInFlightBarriers() {
@@ -681,6 +697,89 @@ size_t SharedGC::markRuntimeRootsImpl(
   markRoots(keys);
   return keys.size();
 }
+
+#ifdef HERMES_SLOW_DEBUG
+std::vector<const SharedGC::SegmentHeader *> SharedGC::regionsByAddressLocked()
+    const {
+  std::vector<const SegmentHeader *> regions;
+  for (const auto &pg : segments_)
+    for (const SegmentHeader &hdr : pg.all)
+      regions.push_back(&hdr);
+  for (const SegmentHeader &hdr : largeRegions_)
+    regions.push_back(&hdr);
+  // std::less, not <, which gives unrelated pointers no order.
+  std::sort(regions.begin(), regions.end(), std::less<const SegmentHeader *>());
+  return regions;
+}
+
+bool SharedGC::isAllocatedLocked(
+    const std::vector<const SegmentHeader *> &regions,
+    const SharedGCCell *cell) {
+  // A cell starts in the first segment of its region, and a region's header
+  // sits at that segment's base.
+  const auto addr = reinterpret_cast<uintptr_t>(cell);
+  const auto *base =
+      reinterpret_cast<const SegmentHeader *>(addr & ~(kSegmentSize - 1));
+  auto it = std::lower_bound(
+      regions.begin(), regions.end(), base, std::less<const SegmentHeader *>());
+  if (it == regions.end() || *it != base)
+    return false;
+  const SegmentHeader *hdr = *it;
+  const uintptr_t first = reinterpret_cast<uintptr_t>(hdr) + kPayloadOffset;
+  if (addr < first || (addr - first) % hdr->stride != 0)
+    return false;
+  const uintptr_t i = (addr - first) / hdr->stride;
+  return i < hdr->numCells && hdr->allocBits.at(i);
+}
+
+size_t SharedGC::countReachableUnmarked() const {
+  assert(!markingOn() && "the trace is not finished while marking is on");
+  std::vector<SharedGCCell *> worklist = copyRootKeys();
+  // Held for the whole walk: every allocated cell is then fully built, and
+  // allocBits stay still while pointers are checked against them.
+  std::lock_guard<std::mutex> lk(mtx_);
+  const std::vector<const SegmentHeader *> regions = regionsByAddressLocked();
+
+  /// Queues every cell the visitor hands it. The walk keeps its own visited
+  /// set rather than reading marks, because the mark acceptor stops at a
+  /// marked cell, and a cell born during the cycle is marked and never traced.
+  struct Queue {
+    std::vector<SharedGCCell *> &cells;
+    void accept(SharedGCCell *cell) {
+      cells.push_back(cell);
+    }
+  } queue{worklist};
+
+  llvh::DenseSet<const SharedGCCell *> visited;
+  size_t lost = 0;
+  while (!worklist.empty()) {
+    SharedGCCell *cell = worklist.back();
+    worklist.pop_back();
+    if (!visited.insert(cell).second)
+      continue;
+    // Checked before anything reads the cell: one lost in an earlier cycle
+    // has been freed, and its memory may be unmapped.
+    if (!isAllocatedLocked(regions, cell)) {
+      ++lost;
+      continue;
+    }
+    if (!isMarked(cell))
+      ++lost;
+    markCell(queue, cell);
+  }
+  return lost;
+}
+
+size_t SharedGC::countDanglingKeys() const {
+  const std::vector<SharedGCCell *> keys = copyRootKeys();
+  std::lock_guard<std::mutex> lk(mtx_);
+  const std::vector<const SegmentHeader *> regions = regionsByAddressLocked();
+  size_t dangling = 0;
+  for (const SharedGCCell *cell : keys)
+    dangling += !isAllocatedLocked(regions, cell);
+  return dangling;
+}
+#endif
 
 size_t SharedGC::drainMarkWorklist() {
   assert(markState_ && "no marking cycle in progress");

@@ -246,4 +246,131 @@ TEST_F(SharedCollectTest, Collect_ReturnsTheHeapToTheOS) {
   EXPECT_EQ(0u, gc.liveCellCountSlow());
 }
 
+TEST_F(SharedCollectTest, Concurrent_MoveBetweenBoxedCellsRetainsTheTarget) {
+  // A producer moves the only reference to `treasure` between two boxed cells,
+  // and allocates garbage, while collect() runs whole cycles. The roots come
+  // from a box map, as they will outside tests, rather than from markRoots.
+  // Where the post-certification check is built, every collect also walks the
+  // heap while the producer stores and allocates.
+  SharedMutator mutatorA{gc, a};
+  auto *src = array();
+  auto *dst = array();
+  auto *treasure = array();
+  src->initField(0, SharedValue::encodePointer(treasure));
+  box(a, src);
+  box(a, dst);
+
+  std::atomic<bool> done{false};
+  std::atomic<uint32_t> moves{0};
+  std::thread producer([&] {
+    SharedMutator local{gc, a};
+    while (!done.load(std::memory_order_acquire)) {
+      SharedArray *from = src, *to = dst;
+      if (from->at(0).isEmpty())
+        std::swap(from, to);
+      const SharedValue held = from->at(0);
+      if (held.isEmpty())
+        continue;
+      // Destination first, so the reference is never in neither slot.
+      to->set(0, held, local);
+      from->set(0, SharedValue::empty(), local);
+      // Longer than `treasure`, so no garbage cell can take its slot and keep
+      // the count below right if it were swept.
+      SharedArray::create(gc, 4);
+      moves.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+  // A thread just started need not run before 200 quick cycles end.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (moves.load(std::memory_order_relaxed) == 0 &&
+         std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  for (uint32_t i = 0; i < 200; ++i)
+    gc.collect();
+  // Stop and join before asserting, or the producer is left running.
+  done.store(true, std::memory_order_release);
+  producer.join();
+  // All the garbage predates this cycle, so it all goes.
+  gc.collect();
+
+  EXPECT_EQ(3u, gc.liveCellCountSlow()) << "treasure was swept";
+  EXPECT_GT(moves.load(), 0u);
+}
+
+#ifdef HERMES_SLOW_DEBUG
+TEST_F(SharedCollectTest, Check_CountsReachableCellsLeftUnmarked) {
+  // Two cells lost to stores no barrier saw: initField puts `lost` into two
+  // cells born this cycle, which are marked and never traced, and nothing
+  // else names it or the `lostChild` it holds. So the walk has to go on
+  // through an unmarked cell, `lost` must count once though reachable twice,
+  // and since the holders are b's while a registered first, every runtime's
+  // keys have to be read. No ASSERT before endCycle: an early return would
+  // leave the cycle open.
+  SharedMutator mutatorA{gc, a};
+  SharedMutator mutatorB{gc, b};
+  auto *lost = array();
+  auto *lostChild = array();
+  lost->initField(0, SharedValue::encodePointer(lostChild));
+
+  gc.beginCycle();
+  while (!gc.pollInFlightBarriers())
+    std::this_thread::yield();
+  gc.beginSecondInFlightPass();
+  while (!gc.pollInFlightBarriers())
+    std::this_thread::yield();
+  auto *holder = array();
+  box(b, holder);
+  holder->initField(0, SharedValue::encodePointer(lost));
+  auto *otherHolder = array();
+  box(b, otherHolder);
+  otherHolder->initField(0, SharedValue::encodePointer(lost));
+  gc.markRuntimeRoots();
+  while (!gc.certifyRound())
+    gc.drainMarkWorklist();
+
+  EXPECT_EQ(2u, gc.countReachableUnmarked());
+  // Mark them by hand, or endCycle's own check fails and the sweep frees them.
+  SharedGC::setCellMarkBit(lost);
+  SharedGC::setCellMarkBit(lostChild);
+  EXPECT_EQ(0u, gc.countReachableUnmarked());
+  gc.endCycle();
+  gc.sweep();
+  EXPECT_EQ(4u, gc.liveCellCountSlow());
+}
+
+TEST_F(SharedCollectTest, Check_CountsAKeyToAFreedCell) {
+  // A key published after the root scan with nothing recorded, for a cell
+  // the sweep has already freed. The cell's region is unmapped by now, so the
+  // check must not read the cell to decide.
+  SharedMutator mutatorA{gc, a};
+  auto *freed = array();
+  gc.collect();
+  ASSERT_EQ(0u, gc.liveCellCountSlow());
+
+  box(a, freed);
+  EXPECT_EQ(1u, gc.countDanglingKeys());
+  // 1 only because nothing survived the collect: its sweep cleared every
+  // survivor's mark, so a survivor would be counted as well.
+  EXPECT_EQ(1u, gc.countReachableUnmarked());
+}
+
+TEST_F(SharedCollectTest, Check_CountsAKeyToAFreedSlotInAMappedSegment) {
+  // As above, but a live neighbour keeps the segment mapped, so only the
+  // allocation bits can tell that the slot was freed.
+  SharedMutator mutatorA{gc, a};
+  auto *kept = array();
+  box(a, kept);
+  auto *freed = array();
+  gc.collect();
+  ASSERT_EQ(1u, gc.liveCellCountSlow());
+  ASSERT_EQ(1u, gc.regionCountSlow());
+
+  box(a, freed);
+  EXPECT_EQ(1u, gc.countDanglingKeys());
+  // `kept` counts too: the sweep cleared its mark.
+  EXPECT_EQ(2u, gc.countReachableUnmarked());
+}
+#endif
+
 } // namespace
