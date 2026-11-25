@@ -55,6 +55,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -539,6 +540,14 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// Record \p box as this runtime's box for \p cell.
   /// \pre there is no live box for \p cell.
   void setBoxForSharedCell(SharedGCCell *cell, Handle<BoxedSharedObject> box);
+
+  /// Append every shared cell this runtime names to \p out -- its contribution
+  /// to the shared heap's root set. Includes keys whose box has died but has
+  /// not been pruned, which over-retains for one cycle and never
+  /// under-retains.
+  ///
+  /// Called on the collector's thread, not this runtime's.
+  void appendSharedRootKeys(std::vector<SharedGCCell *> &out) const;
 
 #ifdef UNIT_TEST
   /// \return the number of entries, live or dead, in the box map.
@@ -1459,6 +1468,25 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// runtime.
   llvh::DenseMap<SharedGCCell *, WeakRoot<BoxedSharedObject>>
       sharedObjectBoxes_{};
+
+  /// Guards the *structure* of sharedObjectBoxes_ against the shared
+  /// collector, which reads this runtime's keys from its own thread as its
+  /// contribution to the shared heap's root set.
+  ///
+  /// Held by the two operations that can move buckets: the insert in
+  /// setBoxForSharedCell, whose operator[] can rehash, and the erase in
+  /// pruneSharedObjectBoxes.
+  ///
+  /// **Deliberately not held by the weak-root walk, nor by a plain lookup.**
+  /// The walk only forwards values, and a key and its value are distinct
+  /// subobjects, so it never races a collector reading keys. A lookup is a
+  /// pure read on the only thread that writes. Keeping the walk out is what
+  /// keeps this lock off every local GC pause, and so out of any priority
+  /// inversion with the collector.
+  ///
+  /// Lock order: the shared heap's allocation lock, then this. Never the
+  /// reverse, and never this then the shared heap's barrier mutex.
+  mutable std::mutex sharedObjectBoxesMtx_;
 
   /// Set when a weak-root pass nulled at least one entry above. The sweep
   /// happens on the next lookup rather than in the pass itself. This

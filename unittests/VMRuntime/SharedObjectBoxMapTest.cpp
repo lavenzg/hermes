@@ -10,6 +10,11 @@
 #include "VMRuntimeTestHelpers.h"
 #include "gtest/gtest.h"
 
+#include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
+
 using namespace hermes::vm;
 
 namespace {
@@ -141,6 +146,76 @@ TEST_F(SharedObjectBoxMapTest, Rebinding_AfterACollectionIsAllowed) {
   auto second = runtime.makeHandle(BoxedSharedObject::create(runtime, cell));
   runtime.setBoxForSharedCell(cell, second);
   EXPECT_EQ(second.get(), runtime.findBoxForSharedCell(cell));
+}
+
+TEST_F(SharedObjectBoxMapTest, RootKeys_AreEveryEntryIncludingDeadOnes) {
+  // This is what the shared collector marks from. A key whose box has died but
+  // has not been pruned must still be included: over-retaining a cell for one
+  // cycle is safe, dropping one is a use-after-free.
+  auto *live = fakeCell(0xA000);
+  auto *dead = fakeCell(0xB000);
+
+  GCScope outer{runtime, "SharedObjectBoxMapTest"};
+  auto keep = runtime.makeHandle(BoxedSharedObject::create(runtime, live));
+  runtime.setBoxForSharedCell(live, keep);
+  {
+    GCScope scope{runtime, "SharedObjectBoxMapTest"};
+    auto doomed = runtime.makeHandle(BoxedSharedObject::create(runtime, dead));
+    runtime.setBoxForSharedCell(dead, doomed);
+  }
+  // Nulls the dead entry's WeakRoot without erasing it.
+  runtime.collect("test");
+  ASSERT_EQ(2u, runtime.sharedObjectBoxCountSlow());
+
+  // Pre-seeded, because it appends rather than assigns -- the collector
+  // accumulates across runtimes.
+  std::vector<SharedGCCell *> keys{fakeCell(0xC000)};
+  runtime.appendSharedRootKeys(keys);
+
+  ASSERT_EQ(3u, keys.size());
+  EXPECT_EQ(fakeCell(0xC000), keys[0]) << "it replaced instead of appending";
+  EXPECT_NE(keys.end(), std::find(keys.begin(), keys.end(), live));
+  EXPECT_NE(keys.end(), std::find(keys.begin(), keys.end(), dead))
+      << "a dead but unpruned key was dropped from the root set";
+}
+
+TEST_F(SharedObjectBoxMapTest, RootKeys_ReadWhileTheOwnerMutatesTheMap) {
+  // The lock's entire purpose, and it proves nothing single-threaded -- it is
+  // here for TSan and for ASan's use-after-free. The reader stands in for the
+  // collector: another thread walking the keys while this one inserts, which
+  // rehashes and frees the old bucket array, and prunes, which erases.
+  //
+  // It also exercises the claim that the weak-root walk needs no lock: the
+  // collections below forward every entry's value while the reader is reading
+  // keys.
+  std::atomic<bool> stop{false};
+  std::thread reader([&] {
+    std::vector<SharedGCCell *> keys;
+    while (!stop.load(std::memory_order_acquire)) {
+      keys.clear();
+      runtime.appendSharedRootKeys(keys);
+    }
+  });
+
+  {
+    GCScope scope{runtime, "SharedObjectBoxMapTest"};
+    for (uintptr_t i = 1; i <= 512; ++i) {
+      GCScopeMarkerRAII marker{runtime};
+      auto *cell = fakeCell(i * 0x100);
+      auto box = runtime.makeHandle(BoxedSharedObject::create(runtime, cell));
+      runtime.setBoxForSharedCell(cell, box);
+      // Every 64 boxes, a collection finds the earlier ones dead and forwards
+      // the live one's value while the reader reads keys. The lookup after it
+      // prunes, which is the erase half of what the lock guards.
+      if (i % 64 == 0)
+        runtime.collect("test");
+      runtime.findBoxForSharedCell(cell);
+    }
+  }
+  stop.store(true, std::memory_order_release);
+  reader.join();
+
+  EXPECT_LT(runtime.sharedObjectBoxCountSlow(), 512u) << "nothing was pruned";
 }
 
 } // namespace

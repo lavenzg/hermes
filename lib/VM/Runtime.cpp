@@ -815,6 +815,8 @@ void Runtime::markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
 
 #ifdef HERMES_ENABLE_SHARED_HEAP
 void Runtime::pruneSharedObjectBoxes() {
+  // Erasing moves buckets, so the collector must not be walking the keys.
+  std::lock_guard<std::mutex> lk(sharedObjectBoxesMtx_);
   // Erasing during iteration is safe on DenseMap.
   for (auto it = sharedObjectBoxes_.begin(), e = sharedObjectBoxes_.end();
        it != e;
@@ -858,7 +860,21 @@ void Runtime::setBoxForSharedCell(
       (it == sharedObjectBoxes_.end() || !it->second.getNoBarrierUnsafe()) &&
       "a second box for one cell breaks strict equality on it");
 #endif
+  // operator[], not insert: DenseMap::insert forwards to try_emplace, which
+  // returns false and leaves an existing key alone, so a materialiser that
+  // switched to it would silently stop deduplicating -- and two boxes for one
+  // cell make a shared object compare unequal to itself.
+  //
+  // Locked because a rehash moves every bucket under the collector's walk.
+  std::lock_guard<std::mutex> lk(sharedObjectBoxesMtx_);
   sharedObjectBoxes_[cell].set(*this, *box);
+}
+
+void Runtime::appendSharedRootKeys(std::vector<SharedGCCell *> &out) const {
+  std::lock_guard<std::mutex> lk(sharedObjectBoxesMtx_);
+  out.reserve(out.size() + sharedObjectBoxes_.size());
+  for (const auto &entry : sharedObjectBoxes_)
+    out.push_back(entry.first);
 }
 #endif // HERMES_ENABLE_SHARED_HEAP
 
