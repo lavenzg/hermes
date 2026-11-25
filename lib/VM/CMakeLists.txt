@@ -165,6 +165,7 @@ if (HERMES_ENABLE_SHARED_HEAP)
     BoxedSharedObject.cpp
     SharedHeap/SharedBarrierRing.cpp
     SharedHeap/SharedGC.cpp
+    SharedHeap/SharedMutator.cpp
   )
 endif()
 

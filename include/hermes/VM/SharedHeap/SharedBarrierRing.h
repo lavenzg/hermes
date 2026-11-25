@@ -23,8 +23,9 @@ namespace vm {
 /// Single producer, single consumer. The producer is the thread owning the
 /// runtime, and is also one of the two consumers -- itself when it spills, the
 /// collector when it steals -- which SharedGC's barrier mutex keeps from
-/// overlapping. The producer never takes that mutex, so what orders slot reuse
-/// is the release/acquire pair on head_, not the lock.
+/// overlapping. The producer takes that mutex only to spill, never while
+/// pushing, so what orders slot reuse is the release/acquire pair on head_
+/// rather than the lock.
 class SharedBarrierRing {
  public:
   /// Entries buffered before the barrier spills. A power of two, so the

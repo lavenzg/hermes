@@ -38,6 +38,7 @@ namespace vm {
 
 class BoxedSharedObject;
 class Runtime;
+class SharedMutator;
 template <typename T>
 class PseudoHandle;
 
@@ -357,15 +358,22 @@ class SharedGC {
 
   /// State that exists only while a marking cycle is running.
   ///
-  /// A mutator can neither name this nor reach anything it owns, which is what
-  /// makes it safe to destroy while barriers are running. Adding an accessor
-  /// for markState_, or moving a barrier-reachable structure in here, breaks
-  /// that.
+  /// A mutator cannot name this: markState_ is private and has no accessor, so
+  /// nothing on the barrier's call graph holds a pointer into it. It does
+  /// reach barrierWorklist below, so what makes destroying this safe while
+  /// barriers run is not that alone -- it is that barrierMtx_ outlives it, and
+  /// every mutator that touches the worklist re-tests markState_ under that
+  /// same lock. Move that mutex in here and the argument collapses.
   struct MarkState {
     /// Local to the marking thread, unlike the barrier worklist a runtime
     /// spills into, so no lock and no atomics. Peak size is bounded by the
     /// number of cells in the shared heap.
     std::stack<SharedGCCell *, std::vector<SharedGCCell *>> localWorklist;
+
+    /// Cells runtimes have spilled out of their rings, waiting to be traced.
+    /// Unlike localWorklist this is written by mutator threads, so every
+    /// access holds barrierMtx_.
+    std::vector<SharedGCCell *> barrierWorklist;
   };
 
   //===--------------------------------------------------------------------===//
@@ -387,11 +395,41 @@ class SharedGC {
 
   const size_t maxSize_;
   std::atomic<size_t> footprint_{0};
-  std::atomic<bool> markingBarriers_{false};
 
   /// An Optional so it can be created and destroyed at the start and end of
   /// marking. Deliberately has no accessor; see MarkState.
   llvh::Optional<MarkState> markState_;
+
+  /// Guards mutators_, markState_'s existence, markState_->barrierWorklist,
+  /// and every ring drain.
+  ///
+  /// It cannot live in MarkState, though everything else per-cycle does. A
+  /// barrier can be preempted and reach spill() after the collector has ended
+  /// the cycle, so the lock it takes is exactly the lock under which "is there
+  /// still a cycle" is decided -- and a mutex cannot guard the lifetime of the
+  /// object holding it.
+  ///
+  /// One lock rather than a second for the registry: registration is once per
+  /// Runtime, so there is nothing to win by splitting, and a single lock
+  /// leaves no ordering to get wrong.
+  mutable std::mutex barrierMtx_;
+
+  /// Odd exactly while marking is on, so one seq_cst load tells a barrier both
+  /// whether marking is on and which cycle it is. Two separate atomics
+  /// could not: marking could turn on between the two loads.
+  ///
+  /// It wraps, and the reason that is harmless is an invariant rather than the
+  /// width: every registered ring is drained at least once per cycle, by a
+  /// steal or by unregisterMutator, so no entry can survive long enough for a
+  /// stamp to alias. A steal that skipped idle runtimes would break that.
+  std::atomic<uint32_t> cycleSeq_{0};
+
+  /// Every registered runtime, so the collector can reach every ring.
+  ///
+  /// A vector rather than an intrusive list: N is the number of Runtimes,
+  /// registration happens once per Runtime, and the only walk is once per
+  /// certification round. It also keeps SharedMutator incomplete here.
+  std::vector<SharedMutator *> mutators_;
 
 #ifndef NDEBUG
   /// Shared across the group: GCBase::nextObjectID is per-Runtime and would
@@ -547,6 +585,45 @@ class SharedGC {
   size_t drainMarkWorklist();
 
   //===--------------------------------------------------------------------===//
+  // The registry and the barrier worklist
+
+  /// Odd exactly while marking is on. A barrier reads this once and stamps
+  /// what it pushes with it.
+  uint32_t cycleSeq() const {
+    return cycleSeq_.load(std::memory_order_seq_cst);
+  }
+
+  /// Add and remove a runtime's barrier state. SharedMutator's constructor and
+  /// destructor are the only callers. Unregistering flushes the ring first.
+  void registerMutator(SharedMutator *mutator);
+  void unregisterMutator(SharedMutator *mutator);
+
+  /// Move \p mutator's ring into the barrier worklist. What
+  /// SharedMutator::push calls when its ring fills.
+  ///
+  /// Safe with no cycle running, which is the case a preempted barrier
+  /// produces: the ring is then consumed without being read, since everything
+  /// in it belongs to a cycle that has already certified.
+  void spill(SharedMutator &mutator);
+
+  /// Move every registered runtime's ring into the barrier worklist.
+  /// \pre a cycle is in progress.
+  /// \return the number of entries taken.
+  size_t stealBarrierEntries();
+
+  /// Take the barrier worklist and mark everything in it, enqueuing what was
+  /// not already marked for tracing.
+  ///
+  /// Takes the entries out under the lock and marks them outside it, so a
+  /// mutator whose ring fills never waits on the collector's tracing.
+  /// \pre a cycle is in progress.
+  /// \return how many cells this call marked. Zero means the round found
+  ///   nothing new, which is the measure certification needs -- an emptiness
+  ///   test is weaker, since churn over already-marked cells never empties
+  ///   anything.
+  size_t drainBarrierWorklist();
+
+  //===--------------------------------------------------------------------===//
   // Mark bits. Reachability is not this class's concern: these are the
   // primitives whoever is tracing calls.
 
@@ -598,16 +675,28 @@ class SharedGC {
     return maxSize_;
   }
 
-  /// Whether the shared collector is in its marking phase. Allocation does not
-  /// read this: newly allocated object is marked by default.
+  /// Whether the shared collector is in its marking phase. Derived from
+  /// cycleSeq_ rather than tracked separately, so it cannot disagree with the
+  /// stamp a barrier pushes or with whether markState_ exists. Allocation does
+  /// not read it: a newly allocated cell is marked by default.
   bool markingOn() const {
-    return markingBarriers_.load(std::memory_order_seq_cst);
-  }
-  void setMarkingOn(bool on) {
-    markingBarriers_.store(on, std::memory_order_seq_cst);
+    return cycleSeq() % 2 == 1;
   }
 
 #ifdef UNIT_TEST
+  /// \return the registered runtimes.
+  size_t mutatorCountSlow() const {
+    std::lock_guard<std::mutex> lk(barrierMtx_);
+    return mutators_.size();
+  }
+
+  /// \return a copy of the barrier worklist, oldest first.
+  std::vector<SharedGCCell *> barrierWorklistSlow() {
+    std::lock_guard<std::mutex> lk(barrierMtx_);
+    assert(markState_ && "no marking cycle in progress");
+    return markState_->barrierWorklist;
+  }
+
   /// \return the number of allocated slots. Walks every region.
   size_t liveCellCountSlow() const {
     std::lock_guard<std::mutex> lk(mtx_);

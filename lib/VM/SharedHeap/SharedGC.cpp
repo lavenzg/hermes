@@ -9,6 +9,7 @@
 #include "hermes/Support/Compiler.h"
 #include "hermes/Support/OSCompat.h"
 #include "hermes/VM/SharedHeap/SharedGC-inline.h"
+#include "hermes/VM/SharedHeap/SharedMutator.h"
 
 #include <iterator>
 #include <limits>
@@ -36,6 +37,10 @@ SharedGC::~SharedGC() {
   assert(
       footprint_.load(std::memory_order_relaxed) == 0 &&
       "every shared cell must be swept before the group is torn down");
+  // A surviving registration means a Runtime outlived the heap it attached to.
+  // Its ~SharedMutator would lock a freed mutex and write a freed vector, and
+  // ASan would report the mutex rather than the ownership bug.
+  assert(mutators_.empty() && "a SharedMutator outlived its SharedGC");
 
   auto releaseAll = [this](SegmentList &list) {
     while (!list.empty()) {
@@ -378,13 +383,46 @@ class HERMES_ATTRIBUTE_INTERNAL_LINKAGE SharedGC::MarkAcceptor final {
 };
 
 void SharedGC::beginCycle() {
-  assert(!markState_ && "a marking cycle is already in progress");
-  markState_.emplace();
+  {
+    // Only the emplace needs this. spill() decides "is there still a cycle" by
+    // testing markState_ under this lock and then dereferencing it, so the
+    // existence transition has to be serialised against it. Nothing below
+    // touches markState_, and keeping the scope tight matters as soon as
+    // anything expensive joins this function.
+    std::lock_guard<std::mutex> lk(barrierMtx_);
+    assert(!markState_ && "a marking cycle is already in progress");
+    markState_.emplace();
+  }
+
+  // Even to odd: turning marking on. A barrier that reads an odd counter
+  // lock-free only stamps an integer with it, and it reaches the worklist only
+  // through barrierMtx_, whose acquire pairs with the release above -- so it
+  // cannot see a half-built markState_, and the two statements need no order
+  // between them.
+  //
+  // The window this leaves -- markState_ alive, marking still off -- is
+  // harmless. A barrier preempted across the previous cycle's end can reach
+  // spill() in it; it finds an even cycleSeq(), so drainInto's stamp test drops
+  // every entry without reading a cell -- the same outcome as the discardAll()
+  // branch it would have taken a moment earlier.
+  cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
+  assert(markingOn() && "beginCycle must leave marking on");
 }
 
 void SharedGC::endCycle() {
+  std::lock_guard<std::mutex> lk(barrierMtx_);
   assert(markState_ && "no marking cycle in progress");
   assert(markState_->localWorklist.empty() && "cells were left untraced");
+  // The barrier worklist is not bookkeeping either: what is in it are cells
+  // that must be marked before the cycle may end, with the same consequence as
+  // localWorklist if dropped -- an unmarked live cell, swept. Certification
+  // drains it, so reaching here non-empty is a driver bug.
+  assert(
+      markState_->barrierWorklist.empty() &&
+      "spilled cells were left untraced");
+  // Odd to even: turning marking off. Same as beginCycle, the order against
+  // the reset below is immaterial -- every lock-taker sees both or neither.
+  cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
   markState_.reset();
 }
 
@@ -409,6 +447,78 @@ size_t SharedGC::drainMarkWorklist() {
     ++traced;
   }
   return traced;
+}
+
+void SharedGC::registerMutator(SharedMutator *mutator) {
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  assert(
+      std::find(mutators_.begin(), mutators_.end(), mutator) ==
+          mutators_.end() &&
+      "mutator registered twice");
+  mutators_.push_back(mutator);
+}
+
+void SharedGC::unregisterMutator(SharedMutator *mutator) {
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  // Flush before dropping the registration. What is still in the ring are SATB
+  // entries, and dropping them can leave a cell unmarked that another runtime
+  // still reaches -- sweep would then free it.
+  if (markState_)
+    mutator->ring_.drainInto(markState_->barrierWorklist, cycleSeq());
+  auto it = std::find(mutators_.begin(), mutators_.end(), mutator);
+  assert(it != mutators_.end() && "unregistering an unknown mutator");
+  // Checked in release too. A double unregister, or a SharedMutator built
+  // against a different SharedGC, would otherwise write through end() and
+  // shrink -- heap corruption in exactly the build with no assert to catch it.
+  if (LLVM_UNLIKELY(it == mutators_.end()))
+    return;
+  // Order does not matter: the only walk is a steal, which visits every entry.
+  *it = mutators_.back();
+  mutators_.pop_back();
+}
+
+void SharedGC::spill(SharedMutator &mutator) {
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  if (!markState_) {
+    // A barrier preempted across the end of a cycle lands here. Everything in
+    // the ring belongs to a cycle that has ended, so the cells may already
+    // be swept and their segments unmapped: consume without reading.
+    mutator.ring_.discardAll();
+    return;
+  }
+  mutator.ring_.drainInto(markState_->barrierWorklist, cycleSeq());
+}
+
+size_t SharedGC::stealBarrierEntries() {
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  assert(markState_ && "no marking cycle in progress");
+  // Holding the lock across the walk is what keeps a Runtime from being
+  // destroyed mid-walk, and what makes this thread each ring's only consumer.
+  std::vector<SharedGCCell *> &barrierWorklist = markState_->barrierWorklist;
+  const size_t before = barrierWorklist.size();
+  for (SharedMutator *mutator : mutators_)
+    mutator->ring_.drainInto(barrierWorklist, cycleSeq());
+  return barrierWorklist.size() - before;
+}
+
+size_t SharedGC::drainBarrierWorklist() {
+  std::vector<SharedGCCell *> taken;
+  {
+    std::lock_guard<std::mutex> lk(barrierMtx_);
+    assert(markState_ && "no marking cycle in progress");
+    taken.swap(markState_->barrierWorklist);
+    // Swapping hands the capacity to `taken`, so give it back rather than let
+    // the next round of spills rebuild it one reallocation at a time under
+    // this lock, where a spilling mutator is waiting.
+    markState_->barrierWorklist.reserve(taken.size());
+  }
+  // Outside the lock on purpose: marking is unbounded work, and a mutator
+  // whose ring fills must not wait on it.
+  MarkAcceptor acceptor(*this);
+  size_t newlyMarked = 0;
+  for (SharedGCCell *cell : taken)
+    newlyMarked += acceptor.accept(cell);
+  return newlyMarked;
 }
 
 } // namespace vm

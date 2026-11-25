@@ -43,10 +43,9 @@ struct DrainGuard {
   SharedGC &gc;
   explicit DrainGuard(SharedGC &gc) : gc(gc) {}
   ~DrainGuard() {
-    // sweep() asserts !markingOn(), so a test that turned marking on and left
-    // it on would otherwise abort here, in teardown, where gtest cannot
-    // attribute the failure to the test that caused it.
-    gc.setMarkingOn(false);
+    // Nothing to turn off first: these boxing tests never turn marking on.
+    // A test that turned marking on and left it on would trip
+    // sweep()'s !markingOn() assert, and should end its own cycle.
     gc.sweep();
     gc.sweep();
   }

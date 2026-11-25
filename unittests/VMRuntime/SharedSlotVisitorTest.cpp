@@ -24,7 +24,6 @@ constexpr size_t kAmpleBudget = 8 << 20;
 /// Free everything. Two sweeps always suffice: cells are born marked, so the
 /// first clears the mark on whatever survives and the second collects it.
 static void freeAll(SharedGC &gc) {
-  gc.setMarkingOn(false);
   gc.sweep();
   gc.sweep();
 }

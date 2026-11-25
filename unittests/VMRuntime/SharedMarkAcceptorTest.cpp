@@ -23,7 +23,6 @@ constexpr size_t kAmpleBudget = 8 << 20;
 /// Free everything. Two sweeps always suffice: cells are born marked, so the
 /// first clears the mark on whatever survives and the second collects it.
 static void freeAll(SharedGC &gc) {
-  gc.setMarkingOn(false);
   gc.sweep();
   gc.sweep();
 }
@@ -60,10 +59,8 @@ struct SharedMarkAcceptorTest : public ::testing::Test {
   /// atomics, so program order is what makes them visible to sweep().
   void cycleFrom(SharedGCCell *root) {
     gc.beginCycle();
-    gc.setMarkingOn(true);
     gc.markRoots({root});
     gc.drainMarkWorklist();
-    gc.setMarkingOn(false);
     gc.endCycle();
     gc.sweep();
   }
@@ -205,15 +202,13 @@ TEST_F(
   auto *b = array(1);
   whiten();
 
-  gc.setMarkingOn(true);
+  gc.beginCycle();
   auto *a = array(1); // born marked, therefore never traced
   link(a, 0, b);
 
-  gc.beginCycle();
   gc.markRoots({a});
   EXPECT_EQ(0u, gc.drainMarkWorklist());
   gc.endCycle();
-  gc.setMarkingOn(false);
   gc.sweep();
 
   EXPECT_EQ(1u, gc.liveCellCountSlow()) << "b should have been swept";
