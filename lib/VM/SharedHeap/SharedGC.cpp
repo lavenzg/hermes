@@ -274,6 +274,17 @@ size_t SharedGC::sweep() {
       !marking &&
       "sweeping clears survivors' marks, so no marker may be running");
 #ifndef NDEBUG
+  {
+    // Not implied by the check above any more. certifyRound turns marking off
+    // inside its own critical section and leaves markState_ alive until
+    // endCycle, so a driver that swept in that window would pass !markingOn(),
+    // free cells the worklists still name, and unmap their segments
+    // underneath them.
+    std::lock_guard<std::mutex> lk(barrierMtx_);
+    assert(!markState_ && "sweeping inside a marking cycle");
+  }
+#endif
+#ifndef NDEBUG
   assert(
       !sweeping_.exchange(true, std::memory_order_relaxed) &&
       "sweep() admits one caller at a time");
@@ -402,8 +413,10 @@ void SharedGC::beginCycle() {
   // cannot see a half-built markState_, and the two statements need no order
   // between them.
   //
-  // The window this leaves -- markState_ alive, marking still off -- is
-  // harmless. A barrier preempted across the previous cycle's end can reach
+  // The window this leaves -- markState_ alive, marking still off -- is not a
+  // new state: certifyRound turns marking off inside its own critical section
+  // and leaves markState_ alive until endCycle, which is why endCycle asserts
+  // that pair. A barrier preempted across the previous cycle's end can reach
   // spill() in it; it finds an even cycleSeq(), so drainInto's stamp test drops
   // every entry without reading a cell -- the same outcome as the discardAll()
   // branch it would have taken a moment earlier.
@@ -422,9 +435,11 @@ void SharedGC::endCycle() {
   assert(
       markState_->barrierWorklist.empty() &&
       "spilled cells were left untraced");
-  // Odd to even: turning marking off. Same as beginCycle, the order against
-  // the reset below is immaterial -- every lock-taker sees both or neither.
-  cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
+  // Certification turns marking off inside its own critical section, so
+  // marking still being on here means the cycle was abandoned rather than
+  // certified.
+  if (markingOn())
+    cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
   markState_.reset();
 }
 
@@ -586,6 +601,46 @@ size_t SharedGC::drainBarrierWorklist() {
   for (SharedGCCell *cell : taken)
     newlyMarked += acceptor.accept(cell);
   return newlyMarked;
+}
+
+bool SharedGC::certifyRound() {
+  assert(markState_ && "no marking cycle in progress");
+  assert(markingOn() && "this cycle has already certified");
+  assert(
+      markState_->localWorklist.empty() &&
+      "drain the local worklist before certifying, or a cell it already holds "
+      "counts as new");
+  // Mark the backlog first, outside the lock. Everything spilled during the
+  // whole tracing phase has piled up in the worklist, and marking it under
+  // barrierMtx_ would stall every mutator whose ring fills -- that is, every
+  // mutator doing a store -- for as long as it takes. Doing it here costs
+  // atomicity nothing: this only removes work, and anything arriving after it
+  // is consumed in the critical section below.
+  if (drainBarrierWorklist() != 0)
+    return false;
+
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  // Rings drain into the same worklist, so the two halves are one observation
+  // rather than two checks a spill could slip between.
+  std::vector<SharedGCCell *> &worklist = markState_->barrierWorklist;
+  // Hoisted: this thread is the only writer of cycleSeq_ and it holds the lock.
+  const uint32_t seq = cycleSeq();
+  for (SharedMutator *mutator : mutators_)
+    mutator->ring_.drainInto(worklist, seq);
+
+  MarkAcceptor acceptor(*this);
+  size_t newlyMarked = 0;
+  for (SharedGCCell *cell : worklist)
+    newlyMarked += acceptor.accept(cell);
+  worklist.clear();
+  if (newlyMarked != 0)
+    return false;
+
+  // Turn marking off before releasing the lock. Outside it, a spill could land
+  // between the last drain above and turning marking off, and nothing would
+  // ever look at it.
+  cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
+  return true;
 }
 
 } // namespace vm

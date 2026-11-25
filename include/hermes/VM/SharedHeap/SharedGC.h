@@ -588,9 +588,18 @@ class SharedGC {
   /// \pre no cycle is in progress.
   void beginCycle();
 
-  /// Destroy the marking state. Turning marking off and sweeping are the
-  /// driver's job, on the thread that traced: marks are set with relaxed
-  /// atomics, so program order is what makes them visible to sweep().
+  /// Destroy the marking state.
+  ///
+  /// Sweeping is never done here. After a *certified* cycle the caller must
+  /// sweep, on the thread that traced: marks are set with relaxed atomics, so
+  /// program order is what makes them visible to the sweep.
+  ///
+  /// Reaching here with marking still on means the cycle was abandoned rather
+  /// than certified, and marking is turned off here instead. An abandoned
+  /// cycle must **not** be swept: its trace is incomplete, so unmarked does not
+  /// mean unreachable. Start another cycle instead -- the marks it left are
+  /// stale but conservative, costing a little retained garbage and nothing
+  /// else.
   /// \pre a cycle is in progress and nothing is left to trace.
   void endCycle();
 
@@ -655,7 +664,9 @@ class SharedGC {
   ///
   /// Safe with no cycle running, which is the case a preempted barrier
   /// produces: the ring is then consumed without being read, since everything
-  /// in it belongs to a cycle that has already certified.
+  /// in it belongs to a cycle that has ended. Between certification and
+  /// endCycle the state still exists, so the drain runs instead -- with an
+  /// even stamp, which matches nothing a barrier can have pushed.
   void spill(SharedMutator &mutator);
 
   /// Move every registered runtime's ring into the barrier worklist.
@@ -674,6 +685,34 @@ class SharedGC {
   ///   test is weaker, since churn over already-marked cells never empties
   ///   anything.
   size_t drainBarrierWorklist();
+
+  /// Try to end the marking cycle: consume the barrier worklist and every
+  /// runtime's ring, mark what they name, and turn marking off if nothing
+  /// was new.
+  ///
+  /// One critical section for all of it, which is the whole point. Read as two
+  /// steps -- worklist empty, then sweep the rings -- it is unsound: the
+  /// collector finds the worklist empty, a runtime spills a cell it has not
+  /// marked into the worklist just checked, the ring sweep finds nothing, the
+  /// round certifies, and that cell is swept. No spill can straddle one
+  /// critical section, and marking is turned off inside it, so no spill can
+  /// land between the last ring drain and marking turning off.
+  ///
+  /// Ring *pushes* do land after all of it, constantly -- a barrier can read
+  /// the counter, be preempted, and push after the cycle has ended. Those are
+  /// made safe by the stamp, not by this critical section.
+  ///
+  /// The measure is "did this mark anything new", not "is anything left".
+  /// Emptiness is the weaker test: a runtime churning references among
+  /// already-marked cells refills the rings forever without ever making the
+  /// heap less traced.
+  ///
+  /// \pre a cycle is in progress and drainMarkWorklist has just emptied the
+  ///   local worklist, so anything found here is genuinely new.
+  /// \return true if the cycle certified, and marking is now off.
+  ///   False leaves newly found cells on the local worklist to be traced
+  ///   before trying again.
+  bool certifyRound();
 
   //===--------------------------------------------------------------------===//
   // Mark bits. Reachability is not this class's concern: these are the
@@ -727,10 +766,12 @@ class SharedGC {
     return maxSize_;
   }
 
-  /// Whether the shared collector is in its marking phase. Derived from
-  /// cycleSeq_ rather than tracked separately, so it cannot disagree with the
-  /// stamp a barrier pushes or with whether markState_ exists. Allocation does
-  /// not read it: a newly allocated cell is marked by default.
+  /// Whether marking is on. Derived from cycleSeq_ rather than tracked
+  /// separately, so it cannot disagree with the stamp a barrier pushes.
+  ///
+  /// Not the same question as "is a cycle in progress": certifyRound turns
+  /// marking off while markState_ stays alive until endCycle. Allocation reads
+  /// neither -- a newly allocated cell is marked by default.
   bool markingOn() const {
     return cycleSeq() % 2 == 1;
   }

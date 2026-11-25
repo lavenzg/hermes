@@ -46,7 +46,8 @@ class SharedMutator {
   /// Safe with no cycle running: a barrier preempted across the end of one
   /// arrives here, and the spill then discards the ring rather than reading
   /// cells that may already be swept.
-  /// \pre the caller owns the Runtime this belongs to.
+  /// \pre the caller owns the Runtime this belongs to, and \p seq is odd --
+  ///   that is, it came from a cycleSeq() read that found marking on.
   void push(SharedGCCell *cell, uint32_t seq);
 
 #ifdef UNIT_TEST

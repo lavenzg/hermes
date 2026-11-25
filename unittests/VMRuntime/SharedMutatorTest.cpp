@@ -240,9 +240,14 @@ TEST_F(SharedMutatorTest, Unregister_WithNoCycleRunning) {
   // Runtimes are created and destroyed with no collection in flight, which is
   // the case the flush above must not assume away.
   auto *cell = array(1);
+  // A stamp from a cycle that has ended, which is the only kind a ring can
+  // still hold once marking is off.
+  gc.beginCycle();
+  const uint32_t stale = gc.cycleSeq();
+  gc.endCycle();
   {
     SharedMutator mutator{gc, runtime};
-    mutator.push(cell, gc.cycleSeq());
+    mutator.push(cell, stale);
   }
   EXPECT_EQ(0u, gc.mutatorCountSlow());
 }
