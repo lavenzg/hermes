@@ -8,6 +8,7 @@
 #pragma once
 
 #include "hermes/ADT/BitArray.h"
+#include "hermes/Support/OptValue.h"
 #include "hermes/VM/HeapAlign.h"
 #include "hermes/VM/SharedHeap/SharedGCCell.h"
 
@@ -15,13 +16,18 @@
 #include "llvh/ADT/simple_ilist.h"
 #include "llvh/Support/MathExtras.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
+#include <new>
+#include <type_traits>
+#include <utility>
 
 namespace hermes {
 namespace vm {
@@ -52,7 +58,10 @@ class SharedGC {
 
   /// Every region of segments is a multiple of this and aligned to it, so
   /// `addr & ~(kSegmentSize - 1)` reaches the header from any cell pointer.
-  static constexpr size_t kLogSegmentSize = 14;
+  ///
+  /// 64 KiB because vm_allocate_aligned requires whole OS pages for both the
+  /// size and the alignment, and 64 KiB is the largest page Hermes meets.
+  static constexpr size_t kLogSegmentSize = 16;
   static constexpr size_t kSegmentSize = size_t{1} << kLogSegmentSize;
 
   /// The shared heap's size buckets.
@@ -256,11 +265,60 @@ class SharedGC {
   ///   into the returned storage. Holding it across construction is what keeps
   ///   a slot that is allocated and marked but not yet a cell invisible to
   ///   anything that walks the heap.
+  /// \pre cellSize <= maxCellSize().
   /// \return raw storage, or nullptr if the budget is exhausted or the mapping
   ///   fails.
   void *allocLocked(uint32_t cellSize);
   void *allocSmallLocked(uint32_t cellSize);
   void *allocLargeLocked(uint32_t cellSize);
+
+  /// Round \p size up to HeapAlign and reject it if no region can hold a cell
+  /// that big.
+  /// \return the rounded size, or None if \p size cannot be served.
+  template <typename T>
+  static OptValue<uint32_t> checkedAlignedSize(uint32_t size) {
+    // On the raw size, not the rounded one -- rounding a too-short size up to
+    // sizeof(T) would hide exactly the caller bug this is here to catch.
+    assert(size >= sizeof(T) && "size must at least cover the cell itself");
+
+    // 64-bit so that rounding a near-UINT32_MAX size cannot wrap into a small
+    // one, which would allocate a cell far too short for the caller.
+    const uint64_t aligned = llvh::alignTo<HeapAlign>(size);
+    if (LLVM_UNLIKELY(aligned > maxCellSize()))
+      return llvh::None;
+    return static_cast<uint32_t>(aligned);
+  }
+
+  /// The half of makeA that runs with mtx_ already held, so an entry point can
+  /// hold the lock across more than the allocation alone.
+  /// \pre mtx_ is held, and \p size has been through checkedAlignedSize<T>.
+  template <typename T, typename... Args>
+  T *makeALocked(uint32_t size, Args &&...args) {
+    static_assert(
+        std::is_base_of<SharedGCCell, T>::value,
+        "T must be a cell in the shared heap");
+    static_assert(
+        isSharedCellKind(T::getCellKind()),
+        "T's CellKind must be in the shared range");
+    static_assert(HeapAlign % alignof(T) == 0, "T out-aligns the shared heap");
+    // Nothing ever runs a shared cell's destructor: sweepRegion only clears
+    // alloc bits, and releaseRegion destroys the Segment, not the cells in it.
+    // A T that owned anything would leak silently on every collection.
+    static_assert(
+        std::is_trivially_destructible<T>::value,
+        "a shared cell is never destroyed, so T must not need to be");
+
+    void *mem = allocLocked(size);
+    if (LLVM_UNLIKELY(!mem))
+      return nullptr;
+
+    T *cell = new (mem) T(std::forward<Args>(args)...);
+    cell->setKind(T::getCellKind());
+#ifndef NDEBUG
+    cell->setDebugAllocationId(nextDebugAllocationId());
+#endif
+    return cell;
+  }
 
   /// Map a region of \p numSegments segments and initialise its header to
   /// hold \p numCells slots of \p stride bytes. Charges the budget.
@@ -292,6 +350,9 @@ class SharedGC {
   SegmentList largeRegions_;
   /// The list sweep() is working through, or null. Guarded by mtx_.
   const SegmentList *listBeingSwept_{nullptr};
+  /// Called after each region sweep() sweeps, with mtx_ released. Only the
+  /// UNIT_TEST overload of sweep() sets it.
+  const std::function<void()> *sweepHook_{nullptr};
 
   const size_t maxSize_;
   std::atomic<size_t> footprint_{0};
@@ -330,6 +391,27 @@ class SharedGC {
   SharedGC(const SharedGC &) = delete;
   SharedGC &operator=(const SharedGC &) = delete;
 
+  //===--------------------------------------------------------------------===//
+  // Allocation and collection
+
+  /// Allocate \p size bytes and construct a \p T into them with \p args.
+  /// **mtx_ is held across T's constructor.** That is what keeps a slot which
+  /// is allocated and marked, but not yet a cell, invisible to anything that
+  /// walks the heap. It constrains T in exchange: its constructor must not
+  /// allocate, take a lock, or trigger allocation in Runtime's heap, which may
+  /// deadlock. \p size is rounded up to HeapAlign before allocation.
+  /// \return nullptr if the budget is exhausted, the mapping fails, or \p size
+  ///   exceeds maxCellSize().
+  template <typename T, typename... Args>
+  T *makeA(uint32_t size, Args &&...args) {
+    const OptValue<uint32_t> alignedSize = checkedAlignedSize<T>(size);
+    if (LLVM_UNLIKELY(!alignedSize))
+      return nullptr;
+
+    std::lock_guard<std::mutex> lk(mtx_);
+    return makeALocked<T>(*alignedSize, std::forward<Args>(args)...);
+  }
+
 #ifndef NDEBUG
   uint32_t nextDebugAllocationId() {
     return debugAllocationId_.fetch_add(1, std::memory_order_relaxed);
@@ -350,6 +432,17 @@ class SharedGC {
   ///   another thread only if it reads the store that turned marking off.
   /// \return mapped bytes returned to the OS.
   size_t sweep();
+
+#ifdef UNIT_TEST
+  /// sweep(), calling \p afterEachRegion after each region it sweeps, with
+  /// mtx_ released, so a test can allocate in the middle of a sweep.
+  size_t sweep(const std::function<void()> &afterEachRegion) {
+    sweepHook_ = &afterEachRegion;
+    const size_t released = sweep();
+    sweepHook_ = nullptr;
+    return released;
+  }
+#endif
 
   //===--------------------------------------------------------------------===//
   // Mark bits. Reachability is not this class's concern: these are the

@@ -318,6 +318,11 @@ size_t SharedGC::sweep() {
         releaseRegion(segmentOf(&hdr));
         lk.lock();
       }
+      if (LLVM_UNLIKELY(sweepHook_)) {
+        lk.unlock();
+        (*sweepHook_)();
+        lk.lock();
+      }
       // Already at the last segment (before starting the sweeping), exit.
       if (atLast)
         break;
