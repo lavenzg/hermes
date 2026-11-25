@@ -28,10 +28,18 @@ using namespace hermes::vm;
 constexpr size_t kAmpleBudget = 8 << 20;
 constexpr uint32_t kRingCapacity = SharedBarrierRing::kCapacity;
 
-/// Free everything. Two sweeps always suffice: cells are born marked, so the
-/// first clears the mark on whatever survives and the second collects it.
+/// Free everything: one complete cycle with no roots marks nothing, so its
+/// sweep frees the heap. A legitimate collection rather than a teardown
+/// special case -- beginCycle's reset clears whatever an abandoned cycle left
+/// behind, which a bare sweep would misread as garbage.
 static void freeAll(SharedGC &gc) {
-  gc.sweep();
+  // A test that failed midway can leave its cycle open.
+  if (gc.markingOn())
+    gc.abortCycle();
+  gc.beginCycle();
+  while (!gc.certifyRound())
+    gc.drainMarkWorklist();
+  gc.endCycle();
   gc.sweep();
 }
 
@@ -54,14 +62,12 @@ TEST_F(SharedMutatorTest, CycleSeq_IsOddOnlyDuringACycle) {
   gc.beginCycle();
   const uint32_t first = gc.cycleSeq();
   EXPECT_EQ(1u, first % 2);
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
   EXPECT_EQ(0u, gc.cycleSeq() % 2);
 
   gc.beginCycle();
   EXPECT_NE(first, gc.cycleSeq()) << "each cycle needs its own identity";
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Runtime_IsTheOneItWasConstructedWith) {
@@ -100,8 +106,7 @@ TEST_F(SharedMutatorTest, Unregister_LeavesTheOthersReachable) {
   second.push(cell, gc.cycleSeq());
   third.push(cell, gc.cycleSeq());
   EXPECT_EQ(2u, gc.stealBarrierEntries());
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Steal_CollectsFromEveryRuntime) {
@@ -119,8 +124,7 @@ TEST_F(SharedMutatorTest, Steal_CollectsFromEveryRuntime) {
   ASSERT_EQ(2u, stolen.size());
   EXPECT_TRUE(
       (stolen[0] == a && stolen[1] == b) || (stolen[0] == b && stolen[1] == a));
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Steal_LeavesTheRingsEmpty) {
@@ -132,8 +136,7 @@ TEST_F(SharedMutatorTest, Steal_LeavesTheRingsEmpty) {
   ASSERT_EQ(1u, gc.stealBarrierEntries());
   EXPECT_EQ(0u, gc.stealBarrierEntries());
   EXPECT_EQ(1u, gc.barrierWorklistSlow().size());
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Steal_DropsEntriesFromAnotherCycle) {
@@ -148,8 +151,7 @@ TEST_F(SharedMutatorTest, Steal_DropsEntriesFromAnotherCycle) {
   mutator.push(cell, seq);
   mutator.push(cell, seq - 4);
   EXPECT_EQ(1u, gc.stealBarrierEntries());
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Steal_AccumulatesAcrossRounds) {
@@ -164,8 +166,7 @@ TEST_F(SharedMutatorTest, Steal_AccumulatesAcrossRounds) {
   mutator.push(cell, gc.cycleSeq());
   ASSERT_EQ(1u, gc.stealBarrierEntries());
   EXPECT_EQ(2u, gc.barrierWorklistSlow().size());
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Push_SpillsWhenTheRingFills) {
@@ -184,8 +185,7 @@ TEST_F(SharedMutatorTest, Push_SpillsWhenTheRingFills) {
 
   // The one that triggered the spill is still in the ring.
   EXPECT_EQ(1u, gc.stealBarrierEntries());
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Push_KeepsSpillingPastTheFirstSpill) {
@@ -204,8 +204,7 @@ TEST_F(SharedMutatorTest, Push_KeepsSpillingPastTheFirstSpill) {
   // A full ring every kRingCapacity pushes, and what is left after the last.
   EXPECT_EQ(kRingCapacity * 4, spilled);
   EXPECT_EQ(5u, remaining);
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Unregister_FlushesTheRingMidCycle) {
@@ -232,8 +231,7 @@ TEST_F(SharedMutatorTest, Unregister_FlushesTheRingMidCycle) {
   ASSERT_EQ(kRingCapacity + 1, flushed.size()) << "the ring was dropped";
   EXPECT_EQ(b, flushed.back());
   EXPECT_EQ(0u, gc.stealBarrierEntries()) << "nothing left to steal";
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Unregister_WithNoCycleRunning) {
@@ -244,7 +242,7 @@ TEST_F(SharedMutatorTest, Unregister_WithNoCycleRunning) {
   // still hold once marking is off.
   gc.beginCycle();
   const uint32_t stale = gc.cycleSeq();
-  gc.endCycle();
+  gc.abortCycle();
   {
     SharedMutator mutator{gc, runtime};
     mutator.push(cell, stale);
@@ -263,8 +261,7 @@ TEST_F(SharedMutatorTest, Spill_WithNoCycleDiscardsTheRing) {
 
   gc.beginCycle();
   const uint32_t stale = gc.cycleSeq();
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 
   for (uint32_t i = 0; i < kRingCapacity + 1; ++i)
     mutator.push(cell, stale);
@@ -275,8 +272,7 @@ TEST_F(SharedMutatorTest, Spill_WithNoCycleDiscardsTheRing) {
 
   gc.beginCycle();
   EXPECT_EQ(0u, gc.stealBarrierEntries()) << "a stale entry was accepted";
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Unregister_FlushesOnlyTheCurrentCycleStamps) {
@@ -295,8 +291,7 @@ TEST_F(SharedMutatorTest, Unregister_FlushesOnlyTheCurrentCycleStamps) {
   const std::vector<SharedGCCell *> flushed = gc.barrierWorklistSlow();
   ASSERT_EQ(1u, flushed.size());
   EXPECT_EQ(live, flushed[0]);
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Register_MidCycleRuntimeIsStolenFrom) {
@@ -307,8 +302,7 @@ TEST_F(SharedMutatorTest, Register_MidCycleRuntimeIsStolenFrom) {
   SharedMutator latecomer{gc, runtime};
   latecomer.push(cell, gc.cycleSeq());
   EXPECT_EQ(1u, gc.stealBarrierEntries());
-  gc.drainBarrierWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, DrainBarrierWorklist_ReportsWhatItNewlyMarked) {
@@ -317,8 +311,6 @@ TEST_F(SharedMutatorTest, DrainBarrierWorklist_ReportsWhatItNewlyMarked) {
   auto *a = array(1);
   auto *b = array(1);
   SharedMutator mutator{gc, runtime};
-  gc.beginCycle();
-  gc.endCycle();
   gc.sweep(); // clears the birth marks
 
   gc.beginCycle();
@@ -334,7 +326,7 @@ TEST_F(SharedMutatorTest, DrainBarrierWorklist_ReportsWhatItNewlyMarked) {
   ASSERT_EQ(1u, gc.stealBarrierEntries());
   EXPECT_EQ(0u, gc.drainBarrierWorklist()) << "nothing new";
   gc.drainMarkWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedMutatorTest, Concurrent_SpillStealAndAttachInOneCycle) {
@@ -389,7 +381,7 @@ TEST_F(SharedMutatorTest, Concurrent_SpillStealAndAttachInOneCycle) {
   gc.drainBarrierWorklist();
   gc.drainMarkWorklist();
   EXPECT_GT(pushed.load(), 0u);
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 } // namespace

@@ -351,6 +351,15 @@ class SharedGC {
   /// sweeper its only writer. \return true if it should be released.
   bool sweepRegion(SegmentHeader *hdr);
 
+  /// Clear every mark bit in the heap without freeing anything: the whiten
+  /// half of what sweep() does, which beginCycle runs so that a cycle always
+  /// starts from an all-white heap.
+  /// \pre mtx_ is held **and no sweep is in progress**. mtx_ alone is not
+  ///   enough: sweepRegion reads and writes mark words without it once
+  ///   beingSwept is set, and its non-atomic read-modify-write would resurrect
+  ///   every other mark in a word this had zeroed.
+  void whitenAllLocked();
+
   //===--------------------------------------------------------------------===//
   // Marking
 
@@ -437,16 +446,23 @@ class SharedGC {
   /// One lock rather than a second for the registry: registration is once per
   /// Runtime, so there is nothing to win by splitting, and a single lock
   /// leaves no ordering to get wrong.
+  /// Lock order, if both are ever held: barrierMtx_ then mtx_. Nothing holds
+  /// both -- beginCycle takes them one after the other, not nested -- but the
+  /// rule binds anyway: makeA holds mtx_ across a cell's constructor, so a
+  /// shared cell whose constructor stored a field would reach spill() and take
+  /// barrierMtx_ the wrong way round.
   mutable std::mutex barrierMtx_;
 
   /// Odd exactly while marking is on, so one seq_cst load tells a barrier both
   /// whether marking is on and which cycle it is. Two separate atomics
   /// could not: marking could turn on between the two loads.
   ///
-  /// It wraps, and the reason that is harmless is an invariant rather than the
-  /// width: every registered ring is drained at least once per cycle, by a
-  /// steal or by unregisterMutator, so no entry can survive long enough for a
-  /// stamp to alias. A steal that skipped idle runtimes would break that.
+  /// It wraps. A certified cycle drains every registered ring at least once,
+  /// by a steal or by unregisterMutator, so an entry cannot survive one --
+  /// but an abandoned cycle drains nothing, so an idle runtime's stale entry
+  /// can outlive arbitrarily many of those and alias after 2^31. Unreachable
+  /// in practice, and the fix if it ever matters is to discard the rings in
+  /// abortCycle.
   std::atomic<uint32_t> cycleSeq_{0};
 
   /// Every registered runtime, so the collector can reach every ring.
@@ -463,6 +479,11 @@ class SharedGC {
   /// Set for the duration of sweep(), to catch a second concurrent sweeper.
   std::atomic<bool> sweeping_{false};
 #endif
+  /// Set by abortCycle, and by endCycle on a cycle that never certified;
+  /// cleared by beginCycle's reset. What the marks mean while it is set is "a
+  /// partial trace reached this", so unmarked no longer implies unreachable
+  /// and sweep() must refuse, in release builds too.
+  bool marksArePartial_{false};
 
  public:
   /// Offset of the first cell in any segment.
@@ -555,8 +576,11 @@ class SharedGC {
   }
 #endif
 
-  /// Free every unmarked cell and clear the mark on every survivor, so that
-  /// starting the next cycle costs a single store.
+  /// Free every unmarked cell and clear the mark on every survivor.
+  ///
+  /// The clear no longer makes beginCycle cheap, since beginCycle resets the
+  /// whole heap regardless, but it is still load-bearing for back-to-back
+  /// sweeps with no cycle between them.
   ///
   /// Allocation may run concurrently; sweeping may not. The sweeper claims a
   /// segment by setting beingSwept and then rewrites its bitmaps without the
@@ -567,6 +591,8 @@ class SharedGC {
   ///   marks are set with relaxed atomics, so program order is what makes
   ///   them visible here. The acquire at the top of sweep() helps a sweep on
   ///   another thread only if it reads the store that turned marking off.
+  /// After abortCycle, or after endCycle on a cycle that never certified, it
+  /// frees nothing: the marks are a partial trace. Debug builds assert.
   /// \return mapped bytes returned to the OS.
   size_t sweep();
 
@@ -584,7 +610,13 @@ class SharedGC {
   //===--------------------------------------------------------------------===//
   // Marking. One cycle runs on one thread, between beginCycle and endCycle.
 
-  /// Create the marking state and turn marking on.
+  /// Create the marking state, clear every mark bit, and turn marking on.
+  ///
+  /// The reset is not housekeeping. Cells are born marked whether or not a
+  /// cycle is running and only a sweep clears a mark, so without it a cell
+  /// allocated since the last sweep arrives here already marked -- and a mark
+  /// tells accept() the cell is already enqueued, so its children never get
+  /// traced and the sweep frees them while still reachable.
   ///
   /// \pre no cycle is in progress.
   /// \pre **no mutator is running.** Turning marking on is a store, not a
@@ -596,20 +628,24 @@ class SharedGC {
   ///   that exists, only tests may call this.
   void beginCycle();
 
-  /// Destroy the marking state.
+  /// Finish a certified cycle: destroy the marking state.
   ///
-  /// Sweeping is never done here. After a *certified* cycle the caller must
-  /// sweep, on the thread that traced: marks are set with relaxed atomics, so
-  /// program order is what makes them visible to the sweep.
   ///
-  /// Reaching here with marking still on means the cycle was abandoned rather
-  /// than certified, and marking is turned off here instead. An abandoned
-  /// cycle must **not** be swept: its trace is incomplete, so unmarked does not
-  /// mean unreachable. Start another cycle instead -- the marks it left are
-  /// stale but conservative, costing a little retained garbage and nothing
-  /// else.
-  /// \pre a cycle is in progress and nothing is left to trace.
+  /// Sweeping is never done here, but the caller must sweep afterwards, on the
+  /// thread that traced: marks are set with relaxed atomics, so program order
+  /// is what makes them visible to the sweep.
+  /// \pre the cycle certified, and nothing is left to trace. Abandoning a
+  ///   cycle goes through abortCycle instead.
   void endCycle();
+
+  /// Abandon a cycle: turn marking off, throw away both worklists, and destroy
+  /// the marking state.
+  ///
+  /// **Do not sweep after this**, because the trace was incomplete: unmarked
+  /// does not mean unreachable, and a sweep would free live cells. Start
+  /// another cycle instead; its bulk reset clears whatever this one marked.
+  /// \pre a cycle is in progress and has not certified.
+  void abortCycle();
 
   /// Mark each of \p roots and enqueue it for tracing. Already-marked roots
   /// are skipped.

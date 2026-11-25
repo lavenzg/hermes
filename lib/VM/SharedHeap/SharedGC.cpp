@@ -12,6 +12,7 @@
 #include "hermes/VM/SharedHeap/SharedGC-inline.h"
 #include "hermes/VM/SharedHeap/SharedMutator.h"
 
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <new>
@@ -125,9 +126,12 @@ void *SharedGC::finishAlloc(SegmentHeader *hdr, uint32_t i) {
   ++hdr->liveCells;
   hdr->nextFreeHint = i + 1;
 
-  // Black allocation, unconditional: no read of markingBarriers_, because a
-  // cell the collector cannot yet reach is indistinguishable from one it has
-  // marked.
+  // Black allocation, and unconditional for a reason stronger than "harmless".
+  // A cell born between certification and the following sweep must be marked
+  // or that sweep frees it, so gating this on markingOn() is wrong even though
+  // it looks like an obvious saving. Within a cycle the mark is what makes a
+  // cell the collector cannot yet reach indistinguishable from one it has
+  // already marked.
   setCellMarkBit(static_cast<SharedGCCell *>(mem));
   return mem;
 }
@@ -228,8 +232,9 @@ bool SharedGC::sweepRegion(SegmentHeader *hdr) {
     // cannot change under it.
     const uint8_t word = mw.load(std::memory_order_relaxed);
     if (word & markMask) {
-      // Clearing survivors here is the mark reset: starting the next cycle is a
-      // single store to markingBarriers_ with no per-cell pass.
+      // Clearing survivors here is half of the mark reset. beginCycle resets
+      // the whole heap, so this is what makes two sweeps in a row free
+      // everything, not what makes beginCycle cheap.
       mw.store(
           static_cast<uint8_t>(word & ~markMask), std::memory_order_relaxed);
       ++live;
@@ -282,8 +287,16 @@ size_t SharedGC::sweep() {
     // underneath them.
     std::lock_guard<std::mutex> lk(barrierMtx_);
     assert(!markState_ && "sweeping inside a marking cycle");
+    // After abortCycle the observable state is identical to after endCycle --
+    // no MarkState, marking is off -- so nothing else here can tell the two
+    // apart, and a sweep on a partial trace frees reachable cells.
+    assert(
+        !marksArePartial_ &&
+        "sweeping after an abandoned cycle; begin another cycle instead");
   }
 #endif
+  if (LLVM_UNLIKELY(marksArePartial_))
+    return 0;
 #ifndef NDEBUG
   assert(
       !sweeping_.exchange(true, std::memory_order_relaxed) &&
@@ -420,6 +433,27 @@ void SharedGC::beginCycle() {
   // spill() in it; it finds an even cycleSeq(), so drainInto's stamp test drops
   // every entry without reading a cell -- the same outcome as the discardAll()
   // branch it would have taken a moment earlier.
+  //
+  // The bulk reset and turning marking on, together, under the allocation lock.
+  //
+  // Cells are born marked whether or not a cycle is running, and only a sweep
+  // clears a mark, so the heap reaching here can hold marks left by allocation
+  // since the last sweep -- or by a cycle that was abandoned. A mark means both
+  // "reachable" and "already enqueued, do not trace its children", and the
+  // second is only true within one cycle: leaving one behind makes accept()
+  // refuse to enqueue that cell, so its children are never traced and the
+  // sweep frees them while they are still reachable.
+  //
+  // Both statements are under mtx_ so nothing can land between them. A cell
+  // born between the two would keep its birth mark and not be traced this
+  // cycle, so a value stored into it before marking turned on, by a runtime
+  // that then dropped its own key for that value, would have no record.
+  //
+  // A birth mark lasts only until the next cycle starts, so a cell held only
+  // as a raw pointer on a C++ stack across a cycle boundary is not covered by
+  // it. Not reachable while only tests start a cycle.
+  std::lock_guard<std::mutex> allocLk(mtx_);
+  whitenAllLocked();
   cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
   assert(markingOn() && "beginCycle must leave marking on");
 }
@@ -427,6 +461,22 @@ void SharedGC::beginCycle() {
 void SharedGC::endCycle() {
   std::lock_guard<std::mutex> lk(barrierMtx_);
   assert(markState_ && "no marking cycle in progress");
+  // Certification turns marking off inside its own critical section, so
+  // marking still being on here means the cycle never certified -- which is
+  // abortCycle's job, because the caller must then not sweep.
+  assert(
+      !markingOn() &&
+      "this cycle never certified; abandon it with abortCycle instead");
+  // Repaired in release as well, not just asserted. cycleSeq_'s parity is what
+  // every barrier reads, so getting here with marking on and leaving it that
+  // way inverts the parity for good: during the next cycle every barrier sees
+  // marking off and records nothing, the cycle certifies immediately, and its
+  // sweep frees whatever was stored during it.
+  if (LLVM_UNLIKELY(markingOn())) {
+    cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
+    // And its marks are a partial trace, which no sweep may act on.
+    marksArePartial_ = true;
+  }
   assert(markState_->localWorklist.empty() && "cells were left untraced");
   // The barrier worklist is not bookkeeping either: what is in it are cells
   // that must be marked before the cycle may end, with the same consequence as
@@ -435,12 +485,53 @@ void SharedGC::endCycle() {
   assert(
       markState_->barrierWorklist.empty() &&
       "spilled cells were left untraced");
-  // Certification turns marking off inside its own critical section, so
-  // marking still being on here means the cycle was abandoned rather than
-  // certified.
-  if (markingOn())
-    cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
   markState_.reset();
+}
+
+void SharedGC::abortCycle() {
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  assert(markState_ && "no marking cycle in progress");
+  assert(markingOn() && "this cycle certified; finish it with endCycle");
+  // Guarded, not unconditional: abandoning a cycle that already certified
+  // would otherwise turn marking back on with no MarkState behind it, so
+  // every mutator would take the slow path and push into rings that spill()
+  // throws away.
+  if (LLVM_LIKELY(markingOn()))
+    cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
+  // Neither worklist has to be drained, unlike endCycle. Their contents are
+  // records for a cycle that will never certify.
+  markState_.reset();
+  // The marks this cycle set are a partial trace: unmarked no longer implies
+  // unreachable, so sweeping now would free live cells. beginCycle's reset is
+  // what clears them.
+  marksArePartial_ = true;
+}
+
+void SharedGC::whitenAllLocked() {
+#ifndef NDEBUG
+  assert(
+      !sweeping_.load(std::memory_order_relaxed) &&
+      "whitening races the sweeper, which reads and writes mark words without "
+      "mtx_ once beingSwept is set");
+#endif
+  marksArePartial_ = false;
+  auto clear = [](SegmentList &list) {
+    for (SegmentHeader &hdr : list) {
+      // memset, not a loop of relaxed stores. By this function's precondition
+      // there is no concurrent accessor, so the atomicity buys nothing here
+      // and costs about nineteen times the time -- and this pass runs under
+      // the allocation lock, where every allocating mutator is waiting. The
+      // words are lock-free atomics, asserted where they are declared, so
+      // writing them as bytes is sound while we are their only accessor.
+      static_assert(
+          sizeof(hdr.markWords) == kMarkWords * sizeof(std::atomic<uint8_t>),
+          "mark words must be contiguous for a bulk clear");
+      std::memset(static_cast<void *>(hdr.markWords), 0, sizeof(hdr.markWords));
+    }
+  };
+  for (auto &pg : segments_)
+    clear(pg.all);
+  clear(largeRegions_);
 }
 
 void SharedGC::markRoots(llvh::ArrayRef<SharedGCCell *> roots) {

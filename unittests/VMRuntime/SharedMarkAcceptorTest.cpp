@@ -20,10 +20,15 @@ using namespace hermes::vm;
 /// Ample enough that budget exhaustion is never the thing under test.
 constexpr size_t kAmpleBudget = 8 << 20;
 
-/// Free everything. Two sweeps always suffice: cells are born marked, so the
-/// first clears the mark on whatever survives and the second collects it.
+/// Free everything: one complete cycle with no roots marks nothing, so its
+/// sweep frees the heap. A legitimate collection rather than a teardown
+/// special case -- beginCycle's reset clears whatever an abandoned cycle left
+/// behind, which a bare sweep would misread as garbage.
 static void freeAll(SharedGC &gc) {
-  gc.sweep();
+  gc.beginCycle();
+  while (!gc.certifyRound())
+    gc.drainMarkWorklist();
+  gc.endCycle();
   gc.sweep();
 }
 
@@ -55,14 +60,23 @@ struct SharedMarkAcceptorTest : public ::testing::Test {
     ASSERT_EQ(live, gc.liveCellCountSlow());
   }
 
+  /// Certify and finish. Every cycle here traces to completion, so it ends
+  /// rather than aborts -- and only a certified cycle may be swept.
+  void certifyAndEnd() {
+    do {
+      gc.drainMarkWorklist();
+    } while (!gc.certifyRound());
+    gc.endCycle();
+  }
+
   /// One full cycle, in the order a driver must use: turn marking on, trace,
-  /// turn it off, then sweep, all on one thread: marks are set with relaxed
+  /// certify, then sweep, all on one thread: marks are set with relaxed
   /// atomics, so program order is what makes them visible to sweep().
   void cycleFrom(SharedGCCell *root) {
     gc.beginCycle();
     gc.markRoots({root});
     gc.drainMarkWorklist();
-    gc.endCycle();
+    certifyAndEnd();
     gc.sweep();
   }
 };
@@ -79,7 +93,7 @@ TEST_F(SharedMarkAcceptorTest, Mark_FollowsAChainTransitively) {
   gc.beginCycle();
   gc.markRoots({a});
   EXPECT_EQ(3u, gc.drainMarkWorklist());
-  gc.endCycle();
+  certifyAndEnd();
 
   EXPECT_TRUE(SharedGC::isMarked(a));
   EXPECT_TRUE(SharedGC::isMarked(b));
@@ -98,7 +112,7 @@ TEST_F(SharedMarkAcceptorTest, Mark_TerminatesOnACycle) {
   gc.beginCycle();
   gc.markRoots({a});
   EXPECT_EQ(2u, gc.drainMarkWorklist());
-  gc.endCycle();
+  certifyAndEnd();
 }
 
 TEST_F(SharedMarkAcceptorTest, Mark_TracesEveryRoot) {
@@ -112,7 +126,7 @@ TEST_F(SharedMarkAcceptorTest, Mark_TracesEveryRoot) {
   gc.beginCycle();
   gc.markRoots({a, b});
   EXPECT_EQ(3u, gc.drainMarkWorklist());
-  gc.endCycle();
+  certifyAndEnd();
 
   EXPECT_TRUE(SharedGC::isMarked(b));
   EXPECT_TRUE(SharedGC::isMarked(aChild));
@@ -130,7 +144,7 @@ TEST_F(SharedMarkAcceptorTest, Mark_SkipsEmptySlots) {
   gc.beginCycle();
   gc.markRoots({a});
   EXPECT_EQ(2u, gc.drainMarkWorklist());
-  gc.endCycle();
+  certifyAndEnd();
   EXPECT_TRUE(SharedGC::isMarked(b));
 }
 
@@ -145,20 +159,22 @@ TEST_F(SharedMarkAcceptorTest, Mark_IsIdempotent) {
   EXPECT_EQ(1u, gc.drainMarkWorklist());
   gc.markRoots({a});
   EXPECT_EQ(0u, gc.drainMarkWorklist());
-  gc.endCycle();
+  certifyAndEnd();
 }
 
 TEST_F(SharedMarkAcceptorTest, Mark_NeverTracesABornMarkedCell) {
   // Black allocation, and also why "nothing new was marked" is not a
-  // termination test on its own.
+  // termination test on its own. Allocated inside the cycle: beginCycle's bulk
+  // reset whitens anything older, so a cell is only black if it was born after
+  // marking was turned on.
+  gc.beginCycle();
   auto *a = array(1);
   auto *b = array(1);
   link(a, 0, b);
 
-  gc.beginCycle();
   gc.markRoots({a});
   EXPECT_EQ(0u, gc.drainMarkWorklist());
-  gc.endCycle();
+  certifyAndEnd();
 }
 
 TEST_F(SharedMarkAcceptorTest, Sweep_FreesWhatTheMarkerDidNotReach) {

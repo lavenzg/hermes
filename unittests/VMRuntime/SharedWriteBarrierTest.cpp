@@ -42,7 +42,11 @@ struct SharedWriteBarrierTest : public RuntimeTestFixture {
   SharedMutator mutator{gc, runtime};
 
   ~SharedWriteBarrierTest() override {
-    gc.sweep();
+    // A rootless cycle, not a bare sweep: see the other suites' freeAll.
+    gc.beginCycle();
+    while (!gc.certifyRound())
+      gc.drainMarkWorklist();
+    gc.endCycle();
     gc.sweep();
   }
 

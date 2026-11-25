@@ -21,10 +21,15 @@ using namespace hermes::vm;
 /// Ample enough that budget exhaustion is never the thing under test.
 constexpr size_t kAmpleBudget = 8 << 20;
 
-/// Free everything. Two sweeps always suffice: cells are born marked, so the
-/// first clears the mark on whatever survives and the second collects it.
+/// Free everything: one complete cycle with no roots marks nothing, so its
+/// sweep frees the heap. A legitimate collection rather than a teardown
+/// special case -- beginCycle's reset clears whatever an abandoned cycle left
+/// behind, which a bare sweep would misread as garbage.
 static void freeAll(SharedGC &gc) {
-  gc.sweep();
+  gc.beginCycle();
+  while (!gc.certifyRound())
+    gc.drainMarkWorklist();
+  gc.endCycle();
   gc.sweep();
 }
 

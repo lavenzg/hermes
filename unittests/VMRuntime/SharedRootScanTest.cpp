@@ -27,10 +27,17 @@ using namespace hermes::vm;
 
 constexpr size_t kAmpleBudget = 8 << 20;
 
-/// Free everything. Two sweeps always suffice: cells are born marked, so the
-/// first clears the mark on whatever survives and the second collects it.
+/// Free everything: one complete cycle with no roots marks nothing, so its
+/// sweep frees the heap. A bare sweep no longer does -- abortCycle leaves the
+/// marks partial, and beginCycle's reset is what clears them.
 static void freeAll(SharedGC &gc) {
-  gc.sweep();
+  // A test that failed midway can leave its cycle open.
+  if (gc.markingOn())
+    gc.abortCycle();
+  gc.beginCycle();
+  while (!gc.certifyRound())
+    gc.drainMarkWorklist();
+  gc.endCycle();
   gc.sweep();
 }
 
@@ -78,7 +85,49 @@ TEST_F(SharedRootScanTest, Scan_MarksEveryAttachedRuntimesKeys) {
   EXPECT_TRUE(SharedGC::isMarked(onlyA));
   EXPECT_TRUE(SharedGC::isMarked(onlyB))
       << "the scan stopped at the first runtime";
-  gc.endCycle();
+  gc.abortCycle();
+}
+
+// These two need beginCycle's bulk reset: without it every cell carries its
+// birth mark, so "no runtime names this, therefore it is unmarked" is not an
+// observable claim. That is why they arrive with the reset rather than with
+// the scan itself.
+TEST_F(SharedRootScanTest, Scan_LeavesACellNoRuntimeNames) {
+  // The other half: a cell outside every map is garbage, and the scan must not
+  // invent a root for it.
+  SharedMutator mutatorA{gc, a};
+  auto *named = array();
+  auto *unnamed = array();
+  box(a, named);
+
+  gc.beginCycle();
+  EXPECT_EQ(1u, gc.markRuntimeRoots());
+  gc.drainMarkWorklist();
+
+  EXPECT_TRUE(SharedGC::isMarked(named));
+  EXPECT_FALSE(SharedGC::isMarked(unnamed));
+  gc.abortCycle();
+}
+
+TEST_F(SharedRootScanTest, Scan_SkipsADetachedRuntime) {
+  // Deregistration is what removes a runtime from the root set. Its map still
+  // holds the key -- the Runtime outlives the mutator here -- so scanning by
+  // registry rather than by runtime is the thing under test.
+  auto *cell = array();
+  box(b, cell);
+  {
+    SharedMutator mutatorB{gc, b};
+    gc.beginCycle();
+    ASSERT_EQ(1u, gc.markRuntimeRoots());
+    gc.abortCycle();
+  }
+
+  gc.beginCycle();
+  EXPECT_EQ(0u, gc.markRuntimeRoots())
+      << "a detached runtime was still scanned";
+  gc.drainMarkWorklist();
+  EXPECT_FALSE(SharedGC::isMarked(cell));
+  gc.abortCycle();
 }
 
 TEST_F(SharedRootScanTest, Scan_ReportsAKeyWhoseBoxHasDied) {
@@ -102,7 +151,7 @@ TEST_F(SharedRootScanTest, Scan_ReportsAKeyWhoseBoxHasDied) {
 
   EXPECT_TRUE(SharedGC::isMarked(cell))
       << "a key whose box died was dropped from the root set";
-  gc.endCycle();
+  gc.abortCycle();
 
   // Only now, once the scan is done: this both proves the box really was dead
   // and prunes the entry, which is the mutator-side half of the same story.
@@ -131,7 +180,7 @@ TEST_F(SharedRootScanTest, Scan_IsIdempotentAndPicksUpLaterBoxes) {
 
   EXPECT_TRUE(SharedGC::isMarked(first));
   EXPECT_TRUE(SharedGC::isMarked(second));
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedRootScanTest, Scan_CopiesUnderTheMapLockAlone) {
@@ -182,9 +231,7 @@ TEST_F(SharedRootScanTest, Scan_CopiesUnderTheMapLockAlone) {
   EXPECT_TRUE(sawCopy) << "the scan never copied b's map";
   EXPECT_TRUE(mapLockHeld) << "the scan copied a map without holding its lock";
   EXPECT_TRUE(spilledDuringCopy) << "a spill waited for the scan's copy";
-  gc.drainBarrierWorklist();
-  gc.drainMarkWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedRootScanTest, Scan_LetsARuntimeSpillWhileAMapIsBusy) {
@@ -228,9 +275,7 @@ TEST_F(SharedRootScanTest, Scan_LetsARuntimeSpillWhileAMapIsBusy) {
 
   EXPECT_TRUE(spilledWhileBusy)
       << "a spill waited for a scan that was waiting for a busy map";
-  gc.drainBarrierWorklist();
-  gc.drainMarkWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedRootScanTest, Scan_SkipsARuntimeThatLeavesWhileItsMapIsBusy) {
@@ -273,9 +318,7 @@ TEST_F(SharedRootScanTest, Scan_SkipsARuntimeThatLeavesWhileItsMapIsBusy) {
 
   EXPECT_TRUE(scannedWhileBusy)
       << "the scan kept trying the map of a runtime that had left";
-  gc.drainBarrierWorklist();
-  gc.drainMarkWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedRootScanTest, Scan_RacesAttachAndDetach) {
@@ -304,7 +347,7 @@ TEST_F(SharedRootScanTest, Scan_RacesAttachAndDetach) {
 
   // The resident runtime's key is found regardless of the churn around it.
   EXPECT_TRUE(SharedGC::isMarked(cell));
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 TEST_F(SharedRootScanTest, Detach_WaitsForACopyOfItsKeysToFinish) {
@@ -358,9 +401,7 @@ TEST_F(SharedRootScanTest, Detach_WaitsForACopyOfItsKeysToFinish) {
   EXPECT_FALSE(leftWhileCopying)
       << "a runtime finished leaving while its keys were being copied";
   EXPECT_TRUE(left.load(std::memory_order_acquire));
-  gc.drainBarrierWorklist();
-  gc.drainMarkWorklist();
-  gc.endCycle();
+  gc.abortCycle();
 }
 
 } // namespace
