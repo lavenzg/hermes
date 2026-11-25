@@ -1,0 +1,345 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+#include "hermes/VM/SharedHeap/SharedGC.h"
+#include "hermes/Support/OSCompat.h"
+
+#include <iterator>
+#include <limits>
+#include <new>
+
+namespace hermes {
+namespace vm {
+
+SharedGC::SharedGC(size_t maxSize) : maxSize_(maxSize) {
+  // Checked once here rather than on every region: vm_allocate_aligned asserts
+  // both the size and the alignment against the OS page size, so a segment
+  // smaller than a page cannot be mapped at all on a 64 KiB-page kernel. In
+  // release the mapping succeeds but the kernel commits a whole page per
+  // segment, which would make footprint() understate real usage several-fold.
+  assert(
+      kSegmentSize % oscompat::page_size() == 0 &&
+      "kSegmentSize must be a multiple of OS pages, or vm_allocate_aligned "
+      "cannot honour the request");
+}
+
+SharedGC::~SharedGC() {
+  // Releasing segments here would free cells another Runtime may still name, so
+  // a non-empty heap at teardown is the group losing track of live cells. The
+  // release below is what happens once that assert is compiled out.
+  assert(
+      footprint_.load(std::memory_order_relaxed) == 0 &&
+      "every shared cell must be swept before the group is torn down");
+
+  auto releaseAll = [this](SegmentList &list) {
+    while (!list.empty()) {
+      SegmentHeader &hdr = list.front();
+      list.pop_front();
+      releaseRegion(segmentOf(&hdr));
+    }
+  };
+  for (auto &pg : segments_)
+    releaseAll(pg.all);
+  releaseAll(largeRegions_);
+}
+
+SharedGC::Segment *SharedGC::createRegion(
+    uint32_t numSegments,
+    uint32_t stride,
+    uint32_t numCells) {
+  assert(numCells >= 1 && "a region must hold at least one cell");
+  assert(numCells <= kAllocBits && "a region cannot outgrow its alloc bitmap");
+  // markWords covers one segment, so a region may only place cells within it.
+  // Bucketed regions are one segment; an oversized region is larger but holds
+  // exactly one cell. Anything else would index past markWords into allocBits.
+  assert(
+      firstGranule() + size_t{numCells - 1} * (stride >> LogHeapAlign) <
+          kMarkBits &&
+      "the last cell's granule falls outside the mark bitmap");
+
+  const uint64_t bytes64 = (uint64_t)numSegments * kSegmentSize;
+  if (LLVM_UNLIKELY(bytes64 > maxSize_))
+    return nullptr;
+  const size_t bytes = static_cast<size_t>(bytes64);
+
+  size_t cur = footprint_.load(std::memory_order_relaxed);
+  do {
+    if (LLVM_UNLIKELY(bytes > maxSize_ - cur))
+      return nullptr;
+  } while (!footprint_.compare_exchange_weak(
+      cur, cur + bytes, std::memory_order_relaxed, std::memory_order_relaxed));
+
+  auto res = oscompat::vm_allocate_aligned(bytes, kSegmentSize);
+  if (LLVM_UNLIKELY(!res)) {
+    // Restore the footprint.
+    footprint_.fetch_sub(bytes, std::memory_order_relaxed);
+    return nullptr;
+  }
+  oscompat::vm_name(*res, bytes, "hermes-shared");
+
+  // Value-initialised, which zeroes the mark words and runs BitArray's
+  // constructor over the alloc bits, so neither bitmap relies on the mapping
+  // arriving zeroed.
+  auto *seg = new (*res) Segment();
+  SegmentHeader *hdr = &seg->header;
+  hdr->numSegments = numSegments;
+  hdr->stride = stride;
+  hdr->numCells = numCells;
+  // Only worth doing where a slot may sit unclaimed: it catches an overflow
+  // out of one cell into a neighbour that has never been handed out. An
+  // oversized region is one cell that finishAlloc unpoisons immediately, so
+  // poisoning it here is unncessary.
+  if (numCells > 1) {
+    __asan_poison_memory_region(seg->allocRegion, bytes - kPayloadOffset);
+  }
+  return seg;
+}
+
+void SharedGC::releaseRegion(Segment *seg) {
+  const size_t bytes = size_t{seg->header.numSegments} * kSegmentSize;
+  seg->~Segment();
+  __asan_unpoison_memory_region(seg, bytes);
+  oscompat::vm_free_aligned(seg, bytes);
+  footprint_.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+void *SharedGC::finishAlloc(SegmentHeader *hdr, uint32_t i) {
+  void *mem = segmentOf(hdr)->allocRegion + size_t{i} * hdr->stride;
+  __asan_unpoison_memory_region(mem, hdr->stride);
+
+  // Nothing is constructed here.
+  hdr->allocBits.set(i, true);
+  ++hdr->liveCells;
+  hdr->nextFreeHint = i + 1;
+
+  // Black allocation, unconditional: no read of markingBarriers_, because a
+  // cell the collector cannot yet reach is indistinguishable from one it has
+  // marked.
+  setCellMarkBit(static_cast<SharedGCCell *>(mem));
+  return mem;
+}
+
+void *SharedGC::allocSmallLocked(uint32_t cellSize) {
+  const uint32_t bucket = SizeBuckets::indexOf(cellSize);
+  Segments &pg = segments_[bucket];
+
+  // Step over segments that filled earlier this cycle, and over the one the
+  // sweeper owns. Nothing frees between sweeps, so a segment passed here
+  // cannot have become allocatable again. beingSwept is tested first: the
+  // sweeper is rewriting that segment's liveCells without mtx_.
+  auto skipUnusable = [&pg] {
+    while (
+        pg.cursor != pg.all.end() &&
+        (pg.cursor->beingSwept || pg.cursor->liveCells == pg.cursor->numCells))
+      ++pg.cursor;
+  };
+  skipUnusable();
+  // A sweep of this list rewinds the cursor only once it is done, so meanwhile
+  // the segments it has freed slots in can be behind the cursor. At the budget,
+  // mapping another segment instead would be refused.
+  if (LLVM_UNLIKELY(pg.cursor == pg.all.end() && listBeingSwept_ == &pg.all)) {
+    pg.cursor = pg.all.begin();
+    skipUnusable();
+  }
+
+  if (LLVM_UNLIKELY(pg.cursor == pg.all.end())) {
+    const uint32_t stride = SizeBuckets::strideOf(bucket);
+    Segment *fresh = createRegion(
+        1,
+        stride,
+        static_cast<uint32_t>((kSegmentSize - kPayloadOffset) / stride));
+    if (LLVM_UNLIKELY(!fresh))
+      return nullptr;
+    pg.cursor = pg.all.insert(pg.all.end(), fresh->header);
+  }
+
+  // Every slot below the hint is occupied -- nothing frees between sweeps --
+  // and every bit at or above numCells is clear, so the search stops at
+  // numCells when the segment is full, which the cursor loop above has ruled
+  // out.
+  SegmentHeader &hdr = *pg.cursor;
+  const uint32_t i = static_cast<uint32_t>(
+      hdr.allocBits.findNextZeroBitFrom(hdr.nextFreeHint));
+  assert(i < hdr.numCells && "the cursor segment must have a free slot");
+  return finishAlloc(&hdr, i);
+}
+
+void *SharedGC::allocLargeLocked(uint32_t cellSize) {
+  // Using uint64_t, otherwise it would overflow on a 32-bit platform.
+  const uint64_t bytes = uint64_t{kPayloadOffset} + cellSize;
+  const uint32_t numSegments =
+      static_cast<uint32_t>((bytes + kSegmentSize - 1) / kSegmentSize);
+  // The whole payload is charged to the one cell, as JumboHeapSegment does.
+  const uint64_t stride = uint64_t{numSegments} * kSegmentSize - kPayloadOffset;
+  assert(
+      stride <= std::numeric_limits<uint32_t>::max() &&
+      "stride exceeds the width of SegmentHeader::stride");
+
+  Segment *seg =
+      createRegion(numSegments, static_cast<uint32_t>(stride), /*numCells*/ 1);
+  if (LLVM_UNLIKELY(!seg))
+    return nullptr;
+
+  void *mem = finishAlloc(&seg->header, 0);
+  largeRegions_.push_back(seg->header);
+  return mem;
+}
+
+void *SharedGC::allocLocked(uint32_t cellSize) {
+  assert(
+      isSizeHeapAligned(cellSize) && "callers must round up before allocating");
+  assert(cellSize >= sizeof(SharedGCCell) && "a cell must hold its own header");
+  assert(cellSize <= maxCellSize() && "a cell must not exceed maxCellSize()");
+
+  return cellSize <= SizeBuckets::kMaxBucketSize ? allocSmallLocked(cellSize)
+                                                 : allocLargeLocked(cellSize);
+}
+
+bool SharedGC::sweepRegion(SegmentHeader *hdr) {
+  // beingSwept keeps allocation off this region, so the sweeper is its only
+  // reader and writer and every operation below is plain.
+  const size_t strideGranules = hdr->stride >> LogHeapAlign;
+  uint32_t live = 0;
+
+  // Skip to the allocated slots rather than testing every one: a segment that
+  // decayed to a few survivors costs a word scan per free run instead of a
+  // pass per slot. Clearing bit i below cannot disturb the walk, which resumes
+  // at i + 1.
+  for (uint32_t i = hdr->allocBits.findNextSetBitFrom(0); i < hdr->numCells;
+       i = hdr->allocBits.findNextSetBitFrom(i + 1)) {
+    const size_t g = firstGranule() + size_t{i} * strideGranules;
+    std::atomic<uint8_t> &mw = hdr->markWords[g / kBitsPerWord];
+    const uint8_t markMask = static_cast<uint8_t>(1u << (g % kBitsPerWord));
+
+    // One load: beingSwept makes the sweeper the only writer, so the word
+    // cannot change under it.
+    const uint8_t word = mw.load(std::memory_order_relaxed);
+    if (word & markMask) {
+      // Clearing survivors here is the mark reset: starting the next cycle is a
+      // single store to markingBarriers_ with no per-cell pass.
+      mw.store(
+          static_cast<uint8_t>(word & ~markMask), std::memory_order_relaxed);
+      ++live;
+    } else {
+      hdr->allocBits.set(i, false);
+    }
+  }
+
+  hdr->liveCells = live;
+  hdr->nextFreeHint = 0;
+  if (live == 0)
+    return true;
+
+#if LLVM_ADDRESS_SANITIZER_BUILD
+  // Deferred to here, and skipped entirely for a region that just emptied:
+  // releaseRegion unpoisons the whole region before unmapping it, so
+  // poisoning a
+  // dying region is undone immediately -- for an oversized cell that is a
+  // pass
+  // over megabytes of shadow for nothing. Poison is only worth writing for a
+  // slot that will be handed out again. Idempotent for slots createRegion
+  // already poisoned and never handed out.
+  for (uint32_t i = 0; i < hdr->numCells; ++i) {
+    if (hdr->allocBits.at(i))
+      continue;
+    __asan_poison_memory_region(
+        segmentOf(hdr)->allocRegion + size_t{i} * hdr->stride, hdr->stride);
+  }
+#endif
+  return false;
+}
+
+size_t SharedGC::sweep() {
+  // Loaded outside the assert on purpose, since an assert is compiled out.
+  // Marks are set with relaxed ordering and markers never take mtx_. On the
+  // thread that marked, program order makes them visible here; a sweep on
+  // another thread sees them only if this acquire reads the store that
+  // turned marking off.
+  const bool marking = markingOn();
+  (void)marking;
+  assert(
+      !marking &&
+      "sweeping clears survivors' marks, so no marker may be running");
+#ifndef NDEBUG
+  assert(
+      !sweeping_.exchange(true, std::memory_order_relaxed) &&
+      "sweep() admits one caller at a time");
+#endif
+  size_t released = 0;
+
+  // One segment at a time, not the whole class. The sweeper has to be a
+  // segment's only writer. Flagging one segment leaves every other one
+  // allocatable.
+  auto sweepList = [this, &released](
+                       SegmentList &list, SegmentList::iterator *cursor) {
+    std::unique_lock<std::mutex> lk(mtx_);
+    // Most buckets are unused in any given heap, and skipping them here is
+    // what keeps a tight sweep loop off mtx_ entirely.
+    if (list.empty())
+      return;
+    listBeingSwept_ = &list;
+    // The segment that is last when the walk begins. Allocation only appends,
+    // so stopping here is what keeps a segment mapped mid-sweep out of this
+    // pass.
+    const SegmentList::iterator last = std::prev(list.end());
+
+    // The iterators survive the unlock below: allocation only appends, which
+    // invalidates nothing on an intrusive list, and the sweeper is the only
+    // caller that erases.
+    for (auto it = list.begin();;) {
+      SegmentHeader &hdr = *it;
+      // Read before the erase below, which is the one thing that can leave
+      // `last` dangling, and only when the tail is what emptied.
+      const bool atLast = it == last;
+      hdr.beingSwept = true;
+      lk.unlock();
+
+      const bool emptied = sweepRegion(&hdr);
+
+      lk.lock();
+      hdr.beingSwept = false;
+      if (!emptied) {
+        ++it;
+      } else {
+        const bool cursorHere = cursor && *cursor == it;
+        it = list.erase(it);
+        // Update the cursor to be valid so that when mtx_ is unlocked below,
+        // allocator can still access it correctly.
+        if (cursorHere)
+          *cursor = it;
+        released += size_t{hdr.numSegments} * kSegmentSize;
+        // Returned to the OS rather than pooled. This is the only place we can
+        // shrink the heap without compaction.
+        lk.unlock();
+        releaseRegion(segmentOf(&hdr));
+        lk.lock();
+      }
+      // Already at the last segment (before starting the sweeping), exit.
+      if (atLast)
+        break;
+    }
+
+    // Rewound because this sweep just falsified the cursor's premise that
+    // everything behind it is full. So reset it to the beginning so that freed
+    // space can be reused.
+    if (cursor)
+      *cursor = list.begin();
+    listBeingSwept_ = nullptr;
+  };
+
+  for (uint32_t b = 0; b < SizeBuckets::kNumBuckets; ++b)
+    sweepList(segments_[b].all, &segments_[b].cursor);
+  sweepList(largeRegions_, nullptr);
+
+#ifndef NDEBUG
+  sweeping_.store(false, std::memory_order_relaxed);
+#endif
+  return released;
+}
+
+} // namespace vm
+} // namespace hermes

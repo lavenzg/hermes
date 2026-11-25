@@ -158,6 +158,14 @@ else()
   message(WARNING "Not linking garbage collector")
 endif()
 
+# The shared heap is not a GC selected by HERMESVM_GCKIND: it coexists with
+# whichever per-Runtime collector is built.
+if (HERMES_ENABLE_SHARED_HEAP)
+  list(APPEND source_files
+    SharedHeap/SharedGC.cpp
+  )
+endif()
+
 set(JITLIBS)
 if (HERMESVM_ALLOW_JIT)
   list(APPEND source_files

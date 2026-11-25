@@ -29,6 +29,13 @@ TEST(SharedGCCellTest, Kind_RoundTrips) {
   EXPECT_EQ(CellKind::SharedArrayKind, cell->getKind());
 }
 
+TEST(SharedGCCellTest, IsSharedCellKind_IsUsableInAConstantExpression) {
+  // An allocation helper templated on the cell type static_asserts on this, so
+  // it has to fold at compile time.
+  static_assert(isSharedCellKind(CellKind::SharedArrayKind), "");
+  static_assert(!isSharedCellKind(CellKind::JSObjectKind), "");
+}
+
 TEST(SharedGCCellTest, IsSharedCellKind_AcceptsOnlySharedKinds) {
   for (CellKind kind : kSharedKinds)
     EXPECT_TRUE(isSharedCellKind(kind)) << cellKindStr(kind);
