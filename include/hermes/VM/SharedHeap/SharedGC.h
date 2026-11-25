@@ -492,6 +492,12 @@ class SharedGC {
   // Mark bits. Reachability is not this class's concern: these are the
   // primitives whoever is tracing calls.
 
+  /// Visit every slot of \p cell with \p acceptor.
+  /// Defined in SharedGC-inline.h, which callers must include: the slot
+  /// visitor reaches SharedArray, which reaches this header.
+  template <typename Acceptor>
+  static void markCell(Acceptor &acceptor, SharedGCCell *cell);
+
   /// Set \p cell's mark bit. Mask and shift, with no load in between.
   ///
   /// Safe before \p cell is constructed -- black allocation marks a slot as it

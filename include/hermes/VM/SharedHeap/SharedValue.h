@@ -73,6 +73,23 @@ class SharedValue {
         v.raw_.load(std::memory_order_relaxed), std::memory_order_release);
   }
 
+  /// \return the cell this slot holds, or nullptr if it holds none. This does
+  /// only one load to avoid TOCTTOU issue.
+  ///
+  /// An acquire, as in the copy constructor: the caller follows the pointer.
+  /// The tracer, for one, reads the cell's mark bit next, and its kind and
+  /// length if it goes on to trace it.
+  SharedGCCell *getPointerOrNull() const {
+    const uint64_t raw = raw_.load(std::memory_order_acquire);
+    if (raw == 0)
+      return nullptr;
+    // memcpy to avoid an int-to-ptr compiler warning, as below.
+    const auto value = static_cast<uintptr_t>(raw);
+    SharedGCCell *ptr;
+    memcpy(&ptr, &value, sizeof(value));
+    return ptr;
+  }
+
   /// \pre isPointer().
   SharedGCCell *getPointer() const {
     assert(isPointer() && "slot holds no pointer");
