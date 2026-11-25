@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <limits>
+#include <memory>
 #include <vector>
 
 namespace {
@@ -279,8 +280,8 @@ TEST_F(SharedGCTest, MakeA_OverMaxCellSize_ReturnsNull) {
 
 TEST_F(SharedGCTest, MakeA_BudgetExhausted_ReturnsNull) {
   SharedGC small{SharedGC::kSegmentSize};
-  // EXPECT rather than ASSERT: a fatal assertion here would skip the drain
-  // below, and ~SharedGC aborts on a non-empty heap.
+  // EXPECT rather than ASSERT, so the refusal below is checked even if this
+  // fails.
   EXPECT_NE(
       nullptr,
       small.makeA<TestCell>(sizeof(TestCell), uint64_t{1}, uint64_t{2}));
@@ -305,6 +306,22 @@ TEST_F(SharedGCTest, MakeA_ObeysTheCollector) {
 }
 
 #ifndef NDEBUG
+TEST(SharedGCTeardownTest, Teardown_FreesCellsLeftInTheHeap) {
+  // Cells in two size buckets and one oversized region, none of them swept.
+  // No runtime is attached, so teardown finds them all unreachable and frees
+  // them, and then checks that the heap is empty.
+  auto heap = std::make_unique<SharedGC>(kAmpleBudget);
+  EXPECT_NE(nullptr, heap->makeA<TestCell>(sizeof(TestCell), 1, 2));
+  EXPECT_NE(nullptr, heap->makeA<TestVarCell>(TestVarCell::sizeFor(8), 8u));
+  const uint32_t oversized =
+      SharedGC::SizeBuckets::kMaxBucketSize / sizeof(uint64_t) + 1;
+  EXPECT_NE(
+      nullptr,
+      heap->makeA<TestVarCell>(TestVarCell::sizeFor(oversized), oversized));
+  EXPECT_EQ(3u, heap->liveCellCountSlow());
+  heap.reset();
+}
+
 TEST_F(SharedGCTest, MakeA_StampsADistinctDebugId) {
   auto *first = gc.makeA<TestCell>(sizeof(TestCell), uint64_t{0}, uint64_t{0});
   auto *second = gc.makeA<TestCell>(sizeof(TestCell), uint64_t{0}, uint64_t{0});

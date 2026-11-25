@@ -37,17 +37,21 @@ SharedGC::SharedGC(size_t maxSize) : maxSize_(maxSize) {
 }
 
 SharedGC::~SharedGC() {
-  // Releasing segments here would free cells another Runtime may still name, so
-  // a non-empty heap at teardown is the group losing track of live cells. The
-  // release below is what happens once that assert is compiled out.
-  assert(
-      footprint_.load(std::memory_order_relaxed) == 0 &&
-      "every shared cell must be swept before the group is torn down");
   // A surviving registration means a Runtime outlived the heap it attached to.
   // Its ~SharedMutator would lock a freed mutex and write a freed vector, and
   // ASan would report the mutex rather than the ownership bug.
   assert(mutators_.empty() && "a SharedMutator outlived its SharedGC");
 
+  // With no runtime attached there are no roots, so a fresh cycle frees every
+  // cell. Finishing one already in progress would not: its marks reflect the
+  // roots it began with.
+  collect();
+  assert(
+      footprint_.load(std::memory_order_relaxed) == 0 &&
+      "a cycle with no roots left cells behind");
+
+  // Empty after the sweep above. Releasing whatever is left here matters only
+  // once that assert is compiled out.
   auto releaseAll = [this](SegmentList &list) {
     while (!list.empty()) {
       SegmentHeader &hdr = list.front();

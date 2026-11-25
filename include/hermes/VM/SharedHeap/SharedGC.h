@@ -535,6 +535,9 @@ class SharedGC {
 
   /// \param maxSize the group-wide budget in mapped bytes.
   explicit SharedGC(size_t maxSize);
+  /// Frees every cell left. No runtime is attached by now, so nothing is a
+  /// root, and one more collect() finds every cell unreachable.
+  /// \pre no runtime is attached, and no cycle is in progress.
   ~SharedGC();
 
   SharedGC(const SharedGC &) = delete;

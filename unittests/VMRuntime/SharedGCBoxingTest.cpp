@@ -39,8 +39,7 @@ class TestCell final : public SharedGCCell {
 
 /// Free everything in \p gc. Two sweeps always suffice: cells are born marked,
 /// so the first clears the mark on whatever survives and the second collects
-/// it. ~SharedGC aborts on a non-empty heap, so this has to run even when a
-/// test fails partway -- hence the guard rather than a call at the end.
+/// it. ~SharedGC would free what is left too.
 struct DrainGuard {
   SharedGC &gc;
   explicit DrainGuard(SharedGC &gc) : gc(gc) {}

@@ -342,6 +342,29 @@ TEST_F(SharedAttachTest, Prune_OfMoreKeysThanARingHolds_KeepsEveryCell) {
     EXPECT_EQ(cells[i], holder->at(i).getPointer());
 }
 
+TEST_F(SharedAttachTest, Teardown_InTheLastRuntimeFreesWhatItBoxed) {
+  // The runtime holds the last reference to its heap, so the heap is torn
+  // down inside ~Runtime, after the runtime has detached, with the cell it
+  // boxed still allocated. Nothing is a root by then, so teardown frees it.
+  auto heap = std::make_shared<SharedGC>(kAmpleBudget);
+  SharedGC *raw = heap.get();
+  const std::weak_ptr<SharedGC> weak = heap;
+  auto rt = Runtime::create(kTestRTConfig, std::move(heap));
+  {
+    struct : public Locals {
+      PinnedValue<BoxedSharedObject> box;
+    } lv;
+    LocalsRAII lraii{*rt, &lv};
+    lv.box = raw->makeBoxed<SharedArray>(
+        *rt, SharedArray::allocationSize(1), uint32_t{1});
+    EXPECT_TRUE(*lv.box);
+  }
+  EXPECT_EQ(1u, raw->liveCellCountSlow());
+  rt.reset();
+  // ~SharedGC, which asserts that it freed everything, has run.
+  EXPECT_TRUE(weak.expired()) << "the heap outlived its last runtime";
+}
+
 TEST_F(SharedAttachTest, Prune_WithMarkingOff_ErasesWithoutPushing) {
   // The common case: an attached runtime prunes between cycles. A push needs
   // a stamp that says marking is on, so this prune must push nothing.

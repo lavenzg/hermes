@@ -31,7 +31,7 @@ struct SharedArrayTest : public ::testing::Test {
   SharedGC gc{kAmpleBudget};
 
   ~SharedArrayTest() override {
-    // The destructor asserts every run has been swept.
+    // Frees what the test allocated; ~SharedGC would too.
     drain(gc);
   }
 };
