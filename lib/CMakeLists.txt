@@ -315,6 +315,10 @@ endif()
 if (HERMESVM_CONTIGUOUS_HEAP)
   string(APPEND HERMESVM_MODEL "_ch")
 endif()
+# Generated code must be built with the same shared-heap setting as the VM.
+if (HERMES_ENABLE_SHARED_HEAP)
+  string(APPEND HERMESVM_MODEL "_sharedheap")
+endif()
 string(APPEND HERMESVM_MODEL "_s" ${HERMESVM_LOG_HEAP_SEGMENT_SIZE})
 # The pointer size is not strictly necessary, but include it for completeness.
 string(APPEND HERMESVM_MODEL "_p" ${CMAKE_SIZEOF_VOID_P})

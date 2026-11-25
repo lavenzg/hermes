@@ -24,6 +24,9 @@
 #ifndef HERMES_IS_MOBILE_BUILD
 #cmakedefine HERMES_IS_MOBILE_BUILD
 #endif
+#ifndef HERMES_ENABLE_SHARED_HEAP
+#cmakedefine HERMES_ENABLE_SHARED_HEAP
+#endif
 
 // GC kind constants.
 #define _HERMESVM_GCVALUE_HADES 0

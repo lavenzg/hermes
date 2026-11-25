@@ -81,6 +81,12 @@ set(RTSources
   FinalizationRegistryTest.cpp
   )
 
+if(HERMES_ENABLE_SHARED_HEAP)
+  list(APPEND RTSources
+    SharedGCCellTest.cpp
+    )
+endif()
+
 add_hermes_unittest(HermesVMRuntimeTests
   ${RTSources}
   LINK_LIBS hermesvm_a

@@ -254,6 +254,9 @@ set(HERMES_ENABLE_DEBUGGER OFF CACHE BOOL
 set(HERMES_MEMORY_INSTRUMENTATION ${HERMES_ENABLE_DEBUGGER} CACHE BOOL
   "Build with memory instrumentation support")
 
+set(HERMES_ENABLE_SHARED_HEAP OFF CACHE BOOL
+  "Build the shared heap for the TC39 shared structs proposal")
+
 set(HERMES_FACEBOOK_BUILD OFF CACHE BOOL
     "Build Facebook (rather than open-source) version of Hermes")
 
@@ -667,6 +670,10 @@ endif()
 
 if (HERMES_MEMORY_INSTRUMENTATION)
   add_definitions(-DHERMES_MEMORY_INSTRUMENTATION)
+endif()
+
+if (HERMES_ENABLE_SHARED_HEAP)
+  add_definitions(-DHERMES_ENABLE_SHARED_HEAP)
 endif()
 
 set(CMAKE_XCODE_ATTRIBUTE_CLANG_CXX_LANGUAGE_STANDARD "c++17")
