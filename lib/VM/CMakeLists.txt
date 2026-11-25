@@ -163,6 +163,7 @@ endif()
 if (HERMES_ENABLE_SHARED_HEAP)
   list(APPEND source_files
     BoxedSharedObject.cpp
+    SharedHeap/SharedBarrierRing.cpp
     SharedHeap/SharedGC.cpp
   )
 endif()
