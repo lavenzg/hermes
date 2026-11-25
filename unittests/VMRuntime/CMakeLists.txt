@@ -83,6 +83,7 @@ set(RTSources
 
 if(HERMES_ENABLE_SHARED_HEAP)
   list(APPEND RTSources
+    BoxedSharedObjectTest.cpp
     SharedGCCellTest.cpp
     SharedGCTest.cpp
     )

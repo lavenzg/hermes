@@ -111,6 +111,9 @@ CELL_CLASS(JSGeneratorObject, "GeneratorObject")
 CELL_CLASS(JSProxy, "Proxy")
 CELL_CLASS(JSBigInt, "BigInt")
 CELL_CLASS(FastArray, "FastArray")
+#ifdef HERMES_ENABLE_SHARED_HEAP
+CELL_KIND(BoxedSharedObject)
+#endif
 
 // The ordering of Callables is set up carefully. We want to be able to
 // express overlapping regions: all Native functions, and functions

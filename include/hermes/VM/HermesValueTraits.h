@@ -33,6 +33,7 @@ HERMES_VM_GCOBJECT(Arguments);
 HERMES_VM_GCOBJECT(ArrayImpl);
 HERMES_VM_GCOBJECT(BigIntPrimitive);
 HERMES_VM_GCOBJECT(BoundFunction);
+HERMES_VM_GCOBJECT(BoxedSharedObject);
 HERMES_VM_GCOBJECT(Callable);
 HERMES_VM_GCOBJECT(DecoratedObject);
 HERMES_VM_GCOBJECT(DictPropertyMap);

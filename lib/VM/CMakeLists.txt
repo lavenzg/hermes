@@ -162,6 +162,7 @@ endif()
 # whichever per-Runtime collector is built.
 if (HERMES_ENABLE_SHARED_HEAP)
   list(APPEND source_files
+    BoxedSharedObject.cpp
     SharedHeap/SharedGC.cpp
   )
 endif()

@@ -90,6 +90,9 @@ RUNTIME_HV_FIELD(lazyObjectClass_, HiddenClass)
 // If the user needs more properties then we should do it properly.
 RUNTIME_HV_FIELD(classNativeFunction1Reserved, HiddenClass)
 RUNTIME_HV_FIELD(classDecoratedObject1Reserved, HiddenClass)
+#ifdef HERMES_ENABLE_SHARED_HEAP
+RUNTIME_HV_FIELD(boxedSharedObjectClass, HiddenClass)
+#endif
 
 RUNTIME_HV_FIELD(iteratorPrototype, JSObject)
 RUNTIME_HV_FIELD(arrayIteratorPrototype, JSObject)

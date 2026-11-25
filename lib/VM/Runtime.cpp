@@ -45,6 +45,10 @@
 #include "hermes/VM/StaticHUtils.h"
 #include "hermes/VM/StringView.h"
 
+#ifdef HERMES_ENABLE_SHARED_HEAP
+#include "hermes/VM/BoxedSharedObject.h"
+#endif
+
 #ifdef HERMESVM_INTERNAL_JAVASCRIPT_NATIVE
 #include "hermes/InternalJavaScript/internal_unit.h"
 #else
@@ -1736,6 +1740,24 @@ void Runtime::initRootHiddenClasses() {
   lv.clazz =
       HiddenClass::createRoot(*this, makeNullHandle<JSObject>(), lazyFlags);
   lazyObjectClass_ = lv.clazz;
+
+#ifdef HERMES_ENABLE_SHARED_HEAP
+  // Reserves the box's overlap slots on a root of its own, so a box never
+  // shares a plain object's class, and makes it non-extensible, so a box gains
+  // neither a prototype nor a property.
+  lv.clazz =
+      HiddenClass::createRoot(*this, makeNullHandle<JSObject>(), ClassFlags{});
+  for (unsigned i = 0; i < JSObject::numOverlapSlots<BoxedSharedObject>();
+       ++i) {
+    auto addResult = HiddenClass::reserveSlot(lv.clazz, *this);
+    assert(
+        addResult != ExecutionStatus::EXCEPTION &&
+        "Could not possibly grow larger than the limit");
+    lv.clazz = *addResult->first;
+  }
+  lv.clazz = HiddenClass::markNoExtend(lv.clazz, *this);
+  boxedSharedObjectClass = lv.clazz;
+#endif
 }
 
 Handle<StringPrimitive> Runtime::allocateCharacterString(char16_t ch) {
