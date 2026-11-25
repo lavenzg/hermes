@@ -160,8 +160,8 @@ TEST_F(SharedRootScanTest, Scan_ReportsAKeyWhoseBoxHasDied) {
 }
 
 TEST_F(SharedRootScanTest, Scan_IsIdempotentAndPicksUpLaterBoxes) {
-  // Re-scanning has to be free, because the intended driver folds it into the
-  // certification loop rather than running it once.
+  // Re-scanning has to be free: markRuntimeRoots promises it is safe and cheap
+  // to call more than once in a cycle.
   SharedMutator mutatorA{gc, a};
   auto *first = array();
   box(a, first);

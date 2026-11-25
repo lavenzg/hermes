@@ -146,8 +146,9 @@ TEST_F(
     SharedInFlightTest,
     Wait_IgnoresARuntimeThatAttachesAfterMarkingTurnsOn) {
   // Its registration is ordered after marking turned on, so even its first
-  // window sees marking on, and waiting for it would only delay tracing. The
-  // resident keeps the wait going, so the poll below does run.
+  // window sees marking on, and the wait beginCycle starts need not cover it;
+  // the second pass's wait does. The resident keeps the wait going, so the
+  // poll below does run.
   SharedMutator resident{gc, runtime};
   resident.enterBarrier();
   gc.beginCycle();
@@ -263,6 +264,38 @@ TEST_F(SharedInFlightTest, Wait_ReadsCountersAcrossThreadsSafely) {
   }
   stop.store(true, std::memory_order_release);
   runtimeThread.join();
+}
+
+TEST_F(SharedInFlightTest, SecondPass_WaitsForAWindowOpenedDuringTheFirst) {
+  // Opened after beginCycle read the counters, so the first pass does not
+  // wait for it -- its test sees marking on -- but its test came before the
+  // second pass's write, so the second pass has to. EXPECT, not ASSERT,
+  // while the window is open: an early return would leave it open.
+  SharedMutator mutator{gc, runtime};
+  gc.beginCycle();
+  mutator.enterBarrier();
+  EXPECT_EQ(1u, gc.cycleSeq() % 2);
+  EXPECT_TRUE(gc.pollInFlightBarriers()) << "the first pass waited for it";
+
+  gc.beginSecondInFlightPass();
+  EXPECT_FALSE(gc.pollInFlightBarriers())
+      << "the second pass ignored a window opened during the first wait";
+  mutator.exitBarrier();
+  EXPECT_TRUE(gc.pollInFlightBarriers());
+  gc.abortCycle();
+}
+
+TEST_F(SharedInFlightTest, SecondPass_LeavesMarkingOn) {
+  // The second pass's write must not change cycleSeq_: an odd increment would
+  // turn marking off before tracing has started, and an even one would change
+  // the stamp, dropping every push still in a ring from the first wait.
+  gc.beginCycle();
+  ASSERT_TRUE(gc.pollInFlightBarriers());
+  const uint32_t before = gc.cycleSeq();
+  gc.beginSecondInFlightPass();
+  EXPECT_EQ(before, gc.cycleSeq());
+  EXPECT_TRUE(gc.pollInFlightBarriers()) << "no window was open";
+  gc.abortCycle();
 }
 
 } // namespace

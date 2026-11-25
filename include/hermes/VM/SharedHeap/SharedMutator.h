@@ -85,7 +85,8 @@ class SharedMutator {
 
   /// Open a barrier window, which runs from a test of the marking flag through
   /// the effect that test guards. Before it traces, the collector waits for
-  /// every window that was open when marking turned on.
+  /// every window that was open when marking turned on, and then for every
+  /// window open when beginSecondInFlightPass looks.
   ///
   /// Windows nest, and only the outermost entry and exit write the counter.
   /// The entry store is seq_cst, and so are the window's load of cycleSeq_,

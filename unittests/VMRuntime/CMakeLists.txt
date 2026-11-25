@@ -87,6 +87,7 @@ if(HERMES_ENABLE_SHARED_HEAP)
     SharedArrayTest.cpp
     SharedBarrierRingTest.cpp
     SharedCertifyTest.cpp
+    SharedCollectTest.cpp
     SharedGCBoxingTest.cpp
     SharedGCCellTest.cpp
     SharedGCTest.cpp

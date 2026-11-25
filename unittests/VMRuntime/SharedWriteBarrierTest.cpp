@@ -309,6 +309,9 @@ TEST_F(SharedWriteBarrierTest, Concurrent_TwoRuntimesStoringOneSlot) {
     gc.beginCycle();
     while (!gc.pollInFlightBarriers())
       std::this_thread::yield();
+    gc.beginSecondInFlightPass();
+    while (!gc.pollInFlightBarriers())
+      std::this_thread::yield();
     gc.markRoots({anchor, shared});
     runToCertification();
     gc.endCycle();
@@ -375,6 +378,9 @@ TEST_F(SharedWriteBarrierTest, Concurrent_MoveBetweenRootsRetainsTheTarget) {
   uint32_t roundsSavedBy = 0;
   for (uint32_t i = 0; i < 300 && survivors == 3; ++i) {
     gc.beginCycle();
+    while (!gc.pollInFlightBarriers())
+      std::this_thread::yield();
+    gc.beginSecondInFlightPass();
     while (!gc.pollInFlightBarriers())
       std::this_thread::yield();
     gc.markRoots({src, dst});

@@ -460,14 +460,37 @@ void SharedGC::beginCycle() {
 
   // Any runtime inside a window now may have tested the flag before the
   // increment above, so tracing waits for each one noted here. One that
-  // registers after this walk needs no wait: barrierMtx_ orders its
-  // registration after the increment, so its first barrier sees marking on.
+  // registers after this walk needs no wait from this pass: barrierMtx_
+  // orders its registration after the increment, so its first barrier sees
+  // marking on.
+  noteBarriersInFlight();
+}
+
+void SharedGC::noteBarriersInFlight() {
   std::lock_guard<std::mutex> lk(barrierMtx_);
   for (const SharedMutator *mutator : mutators_) {
     const uint32_t count = mutator->inFlight_.load(std::memory_order_seq_cst);
     if (count % 2 == 1)
       markState_->awaited.emplace_back(mutator, count);
   }
+}
+
+void SharedGC::beginSecondInFlightPass() {
+  assert(markState_ && "no marking cycle in progress");
+  assert(markingOn() && "the second pass must come before certification");
+  assert(
+      markState_->awaited.empty() &&
+      "the second pass starts only after the first wait is over");
+  // A write that changes nothing; the write is the point. A barrier whose test
+  // of the flag reads it, or a later value, synchronizes with it -- every later
+  // write to cycleSeq_ is a read-modify-write too, so it continues this one's
+  // release sequence -- and so sees everything the first pass learned: every
+  // store made by a window it waited for, and every store a runtime made
+  // before the first pass read its counter. A load would give such a barrier
+  // nothing to synchronize with. It comes before the walk below, so a window
+  // that opens after the walk reads its counter tests the flag after it.
+  cycleSeq_.fetch_add(0, std::memory_order_seq_cst);
+  noteBarriersInFlight();
 }
 
 void SharedGC::endCycle() {
@@ -550,10 +573,35 @@ void SharedGC::markRoots(llvh::ArrayRef<SharedGCCell *> roots) {
   assert(markState_ && "no marking cycle in progress");
   assert(
       markState_->awaited.empty() &&
-      "marking before the barriers in flight at the start have finished");
+      "marking before the in-flight waits are over");
   MarkAcceptor acceptor(*this);
   for (SharedGCCell *root : roots)
     acceptor.accept(root);
+}
+
+size_t SharedGC::collect() {
+  beginCycle();
+
+  // A wait lasts one barrier unless a runtime is descheduled inside it, so
+  // yielding is enough; there is nothing to block on.
+  while (!pollInFlightBarriers())
+    std::this_thread::yield();
+  beginSecondInFlightPass();
+  while (!pollInFlightBarriers())
+    std::this_thread::yield();
+
+  // Roots first, then trace. certifyRound requires an empty local worklist on
+  // entry, so the drain has to lead each round rather than follow it.
+  markRuntimeRoots();
+  do {
+    drainMarkWorklist();
+  } while (!certifyRound());
+
+  // certifyRound turned marking off inside its own critical section, which is
+  // what lets endCycle accept the cycle. The sweep stays on this thread, the
+  // one that set the marks, so program order makes them visible to it.
+  endCycle();
+  return sweep();
 }
 
 bool SharedGC::pollInFlightBarriers() {
@@ -638,7 +686,7 @@ size_t SharedGC::drainMarkWorklist() {
   assert(markState_ && "no marking cycle in progress");
   assert(
       markState_->awaited.empty() &&
-      "tracing before the barriers in flight at the start have finished");
+      "tracing before the in-flight waits are over");
   MarkAcceptor acceptor(*this);
   auto &localWorklist = markState_->localWorklist;
   size_t traced = 0;
@@ -720,7 +768,7 @@ size_t SharedGC::drainBarrierWorklist() {
     assert(markState_ && "no marking cycle in progress");
     assert(
         markState_->awaited.empty() &&
-        "marking before the barriers in flight at the start have finished");
+        "marking before the in-flight waits are over");
     taken.swap(markState_->barrierWorklist);
     // Swapping hands the capacity to `taken`, so give it back rather than let
     // the next round of spills rebuild it one reallocation at a time under
@@ -741,7 +789,7 @@ bool SharedGC::certifyRound() {
   assert(markingOn() && "this cycle has already certified");
   assert(
       markState_->awaited.empty() &&
-      "certifying before the barriers in flight at the start have finished");
+      "certifying before the in-flight waits are over");
   assert(
       markState_->localWorklist.empty() &&
       "drain the local worklist before certifying, or a cell it already holds "
@@ -760,9 +808,11 @@ bool SharedGC::certifyRound() {
   // acquire load, a barrier's slot store releases the push made before it,
   // and the next writer's pre-read acquires that store in turn. So every push
   // made before the value the trace read, along the chain of writers to that
-  // slot, is already visible here. The lock's acquire could not stand in for
-  // the trace's: a barrier does not take this lock on its fast path, so there
-  // is no release of it to pair with.
+  // slot, is already visible here. A writer whose test saw marking off makes
+  // no pre-read, so the chain breaks at its store; collect()'s two in-flight
+  // waits are what make the pushes before that store visible. The lock's
+  // acquire could not stand in for the trace's: a barrier does not take this
+  // lock on its fast path, so there is no release of it to pair with.
   //
   // Rings drain into the same worklist, so the two halves are one observation
   // rather than two checks a spill could slip between.
