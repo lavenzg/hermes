@@ -20,6 +20,7 @@ SharedMutator::SharedMutator(SharedGC &gc, Runtime &runtime)
 }
 
 SharedMutator::~SharedMutator() {
+  assert(barrierDepth_ == 0 && "destroyed inside a barrier window");
 #ifndef NDEBUG
   detached_ = true;
 #endif

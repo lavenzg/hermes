@@ -408,6 +408,12 @@ class SharedGC {
     /// Unlike localWorklist this is written by mutator threads, so every
     /// access holds barrierMtx_.
     std::vector<SharedGCCell *> barrierWorklist;
+
+    /// Runtimes that were inside a barrier window when marking turned on,
+    /// each with the counter value it showed then. Local to the marking
+    /// thread, like localWorklist. Nothing may mark, trace or certify until it
+    /// is empty.
+    std::vector<std::pair<const SharedMutator *, uint32_t>> awaited;
   };
 
   //===--------------------------------------------------------------------===//
@@ -468,8 +474,8 @@ class SharedGC {
   /// Every registered runtime, so the collector can reach every ring.
   ///
   /// A vector rather than an intrusive list: N is the number of Runtimes,
-  /// registration happens once per Runtime, and the only walk is once per
-  /// certification round. It also keeps SharedMutator incomplete here.
+  /// registration happens once per Runtime, and only cycle steps and polls
+  /// walk it, never a store. It also keeps SharedMutator incomplete here.
   std::vector<SharedMutator *> mutators_;
 
 #ifndef NDEBUG
@@ -610,7 +616,8 @@ class SharedGC {
   //===--------------------------------------------------------------------===//
   // Marking. One cycle runs on one thread, between beginCycle and endCycle.
 
-  /// Create the marking state, clear every mark bit, and turn marking on.
+  /// Create the marking state, clear every mark bit, turn marking on, and note
+  /// every runtime that is inside a barrier window.
   ///
   /// The reset is not housekeeping. Cells are born marked whether or not a
   /// cycle is running and only a sweep clears a mark, so without it a cell
@@ -618,14 +625,14 @@ class SharedGC {
   /// tells accept() the cell is already enqueued, so its children never get
   /// traced and the sweep frees them while still reachable.
   ///
+  /// Mutators may keep running. Turning marking on is a store, not a
+  /// handshake: a barrier that read cycleSeq_ and saw marking off just before
+  /// this can still land its store afterwards, unrecorded, and the cell it
+  /// overwrote would then be swept while still reachable. So nothing may
+  /// mark, trace or certify until pollInFlightBarriers() returns true, which
+  /// it does once every window noted here has closed.
+  ///
   /// \pre no cycle is in progress.
-  /// \pre **no mutator is running.** Turning marking on is a store, not a
-  ///   handshake: a barrier that read the counter and saw marking off just
-  ///   before this can still land its store afterwards, unrecorded, and the
-  ///   cell it overwrote is then swept while still reachable.
-  ///   Making this safe against running mutators needs the collector to wait,
-  ///   after turning marking on, until no runtime is inside a barrier; until
-  ///   that exists, only tests may call this.
   void beginCycle();
 
   /// Finish a certified cycle: destroy the marking state.
@@ -649,7 +656,8 @@ class SharedGC {
 
   /// Mark each of \p roots and enqueue it for tracing. Already-marked roots
   /// are skipped.
-  /// \pre a cycle is in progress, and every root is a live cell in a shared
+  /// \pre a cycle is in progress and its in-flight barriers are done (see
+  ///   pollInFlightBarriers()), and every root is a live cell in a shared
   ///   segment.
   void markRoots(llvh::ArrayRef<SharedGCCell *> roots);
 
@@ -665,7 +673,8 @@ class SharedGC {
   /// idempotent, so a later scan only picks up runtimes that have boxed
   /// something since.
   ///
-  /// \pre a cycle is in progress, on the thread that began tracing it.
+  /// \pre a cycle is in progress and its in-flight barriers are done, on the
+  ///   thread that began tracing it.
   size_t markRuntimeRoots() {
     return markRuntimeRootsImpl(nullptr);
   }
@@ -679,12 +688,30 @@ class SharedGC {
   }
 #endif
 
+  /// Poll the barrier windows that were open when marking turned on.
+  /// \return true once every one of them has closed. Tracing must wait for
+  ///   that.
+  ///
+  /// Each call re-reads the runtimes still being waited for and drops those
+  /// whose counter has changed or that have unregistered. Any change will do,
+  /// even to another odd value: the window being waited for has closed, and
+  /// every window a runtime opens after beginCycle read its counter sees
+  /// marking on. So a busy runtime cannot hold this off, and an idle one,
+  /// whose counter is even, is never waited for.
+  ///
+  /// Each call takes barrierMtx_ briefly. Wait between calls without holding
+  /// it: a runtime inside a window may need it to spill.
+  ///
+  /// \pre a cycle is in progress, on the thread that began it.
+  bool pollInFlightBarriers();
+
   /// Trace until the mark worklist is empty.
   ///
   /// Unbudgeted, unlike HadesGC::incrementalMark: markLimit bounds how long
   /// Hades's marker holds gcMutex_, and this one holds no lock.
   ///
-  /// \pre a cycle is in progress, on the thread that began tracing it.
+  /// \pre a cycle is in progress and its in-flight barriers are done, on the
+  ///   thread that began tracing it.
   /// \return the number of cells traced.
   size_t drainMarkWorklist();
 
@@ -723,7 +750,7 @@ class SharedGC {
   ///
   /// Takes the entries out under the lock and marks them outside it, so a
   /// mutator whose ring fills never waits on the collector's tracing.
-  /// \pre a cycle is in progress.
+  /// \pre a cycle is in progress and its in-flight barriers are done.
   /// \return how many cells this call marked. Zero means the round found
   ///   nothing new, which is the measure certification needs -- an emptiness
   ///   test is weaker, since churn over already-marked cells never empties
@@ -743,7 +770,7 @@ class SharedGC {
   /// land between the last ring drain and marking turning off.
   ///
   /// Ring *pushes* do land after all of it, constantly -- a barrier can read
-  /// the counter, be preempted, and push after the cycle has ended. Those are
+  /// cycleSeq_, be preempted, and push after the cycle has ended. Those are
   /// made safe by the stamp, not by this critical section.
   ///
   /// The measure is "did this mark anything new", not "is anything left".
@@ -751,8 +778,9 @@ class SharedGC {
   /// already-marked cells refills the rings forever without ever making the
   /// heap less traced.
   ///
-  /// \pre a cycle is in progress and drainMarkWorklist has just emptied the
-  ///   local worklist, so anything found here is genuinely new.
+  /// \pre a cycle is in progress, its in-flight barriers are done, and
+  ///   drainMarkWorklist has just emptied the local worklist, so anything
+  ///   found here is genuinely new.
   /// \return true if the cycle certified, and marking is now off.
   ///   False leaves newly found cells on the local worklist to be traced
   ///   before trying again.

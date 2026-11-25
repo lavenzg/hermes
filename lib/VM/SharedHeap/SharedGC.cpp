@@ -410,17 +410,17 @@ class HERMES_ATTRIBUTE_INTERNAL_LINKAGE SharedGC::MarkAcceptor final {
 
 void SharedGC::beginCycle() {
   {
-    // Only the emplace needs this. spill() decides "is there still a cycle" by
-    // testing markState_ under this lock and then dereferencing it, so the
-    // existence transition has to be serialised against it. Nothing below
-    // touches markState_, and keeping the scope tight matters as soon as
-    // anything expensive joins this function.
+    // The emplace needs this lock: spill() decides "is there still a cycle" by
+    // testing markState_ under it and then dereferencing it, so the existence
+    // transition has to be serialised against it. The reset below does not,
+    // and keeping the scope tight matters as soon as anything expensive joins
+    // this function.
     std::lock_guard<std::mutex> lk(barrierMtx_);
     assert(!markState_ && "a marking cycle is already in progress");
     markState_.emplace();
   }
 
-  // Even to odd: turning marking on. A barrier that reads an odd counter
+  // Even to odd: turning marking on. A barrier that reads an odd cycleSeq_
   // lock-free only stamps an integer with it, and it reaches the worklist only
   // through barrierMtx_, whose acquire pairs with the release above -- so it
   // cannot see a half-built markState_, and the two statements need no order
@@ -452,10 +452,22 @@ void SharedGC::beginCycle() {
   // A birth mark lasts only until the next cycle starts, so a cell held only
   // as a raw pointer on a C++ stack across a cycle boundary is not covered by
   // it. Not reachable while only tests start a cycle.
-  std::lock_guard<std::mutex> allocLk(mtx_);
+  std::unique_lock<std::mutex> allocLk(mtx_);
   whitenAllLocked();
   cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
   assert(markingOn() && "beginCycle must leave marking on");
+  allocLk.unlock();
+
+  // Any runtime inside a window now may have tested the flag before the
+  // increment above, so tracing waits for each one noted here. One that
+  // registers after this walk needs no wait: barrierMtx_ orders its
+  // registration after the increment, so its first barrier sees marking on.
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  for (const SharedMutator *mutator : mutators_) {
+    const uint32_t count = mutator->inFlight_.load(std::memory_order_seq_cst);
+    if (count % 2 == 1)
+      markState_->awaited.emplace_back(mutator, count);
+  }
 }
 
 void SharedGC::endCycle() {
@@ -536,9 +548,33 @@ void SharedGC::whitenAllLocked() {
 
 void SharedGC::markRoots(llvh::ArrayRef<SharedGCCell *> roots) {
   assert(markState_ && "no marking cycle in progress");
+  assert(
+      markState_->awaited.empty() &&
+      "marking before the barriers in flight at the start have finished");
   MarkAcceptor acceptor(*this);
   for (SharedGCCell *root : roots)
     acceptor.accept(root);
+}
+
+bool SharedGC::pollInFlightBarriers() {
+  assert(markState_ && "no marking cycle in progress");
+  auto &awaited = markState_->awaited;
+  if (awaited.empty())
+    return true;
+  std::lock_guard<std::mutex> lk(barrierMtx_);
+  auto moved = [this](const std::pair<const SharedMutator *, uint32_t> &e) {
+    // Look the runtime up before reading its counter: the lock keeps a
+    // registered runtime alive, and one that has unregistered runs no more
+    // barriers. A runtime registered since at a freed one's address is read
+    // in its place, which at worst waits for its window too.
+    if (std::find(mutators_.begin(), mutators_.end(), e.first) ==
+        mutators_.end())
+      return true;
+    return e.first->inFlight_.load(std::memory_order_seq_cst) != e.second;
+  };
+  awaited.erase(
+      std::remove_if(awaited.begin(), awaited.end(), moved), awaited.end());
+  return awaited.empty();
 }
 
 std::vector<SharedGCCell *> SharedGC::copyRootKeys(
@@ -600,6 +636,9 @@ size_t SharedGC::markRuntimeRootsImpl(
 
 size_t SharedGC::drainMarkWorklist() {
   assert(markState_ && "no marking cycle in progress");
+  assert(
+      markState_->awaited.empty() &&
+      "tracing before the barriers in flight at the start have finished");
   MarkAcceptor acceptor(*this);
   auto &localWorklist = markState_->localWorklist;
   size_t traced = 0;
@@ -645,7 +684,7 @@ void SharedGC::unlinkMutator(SharedMutator *mutator) {
   // shrink -- heap corruption in exactly the build with no assert to catch it.
   if (LLVM_UNLIKELY(it == mutators_.end()))
     return;
-  // Order does not matter: the only walk is a steal, which visits every entry.
+  // Order does not matter: no walk depends on it.
   *it = mutators_.back();
   mutators_.pop_back();
 }
@@ -679,6 +718,9 @@ size_t SharedGC::drainBarrierWorklist() {
   {
     std::lock_guard<std::mutex> lk(barrierMtx_);
     assert(markState_ && "no marking cycle in progress");
+    assert(
+        markState_->awaited.empty() &&
+        "marking before the barriers in flight at the start have finished");
     taken.swap(markState_->barrierWorklist);
     // Swapping hands the capacity to `taken`, so give it back rather than let
     // the next round of spills rebuild it one reallocation at a time under
@@ -697,6 +739,9 @@ size_t SharedGC::drainBarrierWorklist() {
 bool SharedGC::certifyRound() {
   assert(markState_ && "no marking cycle in progress");
   assert(markingOn() && "this cycle has already certified");
+  assert(
+      markState_->awaited.empty() &&
+      "certifying before the barriers in flight at the start have finished");
   assert(
       markState_->localWorklist.empty() &&
       "drain the local worklist before certifying, or a cell it already holds "

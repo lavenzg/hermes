@@ -74,8 +74,7 @@ struct SharedWriteBarrierTest : public RuntimeTestFixture {
 };
 
 TEST_F(SharedWriteBarrierTest, Store_WithMarkingOff_RecordsNothing) {
-  // The common path. Nothing reaches the ring, so nothing costs anything
-  // beyond one counter load.
+  // The common path: nothing reaches the ring.
   auto *holder = array(1);
   auto *victim = array(0);
   holder->initField(0, SharedValue::encodePointer(victim));
@@ -308,6 +307,8 @@ TEST_F(SharedWriteBarrierTest, Concurrent_TwoRuntimesStoringOneSlot) {
   size_t survivors = 4;
   for (uint32_t i = 0; i < 200 && survivors == 4; ++i) {
     gc.beginCycle();
+    while (!gc.pollInFlightBarriers())
+      std::this_thread::yield();
     gc.markRoots({anchor, shared});
     runToCertification();
     gc.endCycle();
@@ -334,11 +335,12 @@ TEST_F(SharedWriteBarrierTest, Concurrent_MoveBetweenRootsRetainsTheTarget) {
   // of the cleared slot saves it. If the barrier is wrong the live count drops
   // and the collector goes on to trace freed memory, which ASan reports.
   //
-  // Note this test cannot see the race with turning marking on: the clearing
-  // store's load of the marking flag is sequenced after the destination store,
-  // so once marking is seen to be on, the clear is barriered. That is why it
-  // is stable, and also why it is not evidence that turning marking on is safe
-  // against running mutators.
+  // markRoots requires the wait after beginCycle: the producer can be inside
+  // set() when a cycle begins. On x86 and ARMv8 this test would keep
+  // `treasure` without the wait, since the clearing store tests the flag only
+  // after the destination store lands, but the C++ memory model does not order
+  // that store before the tracer's read without it. Either way, the test is
+  // not evidence for the wait.
   //
   // Both slots are roots on purpose. Modelling the producer's own reference as
   // invisible to the collector would make this a test of a missing root set,
@@ -373,6 +375,8 @@ TEST_F(SharedWriteBarrierTest, Concurrent_MoveBetweenRootsRetainsTheTarget) {
   uint32_t roundsSavedBy = 0;
   for (uint32_t i = 0; i < 300 && survivors == 3; ++i) {
     gc.beginCycle();
+    while (!gc.pollInFlightBarriers())
+      std::this_thread::yield();
     gc.markRoots({src, dst});
     // A round fails only when certification marked something the trace did not
     // reach, so this counts the times the barrier was actually load-bearing.

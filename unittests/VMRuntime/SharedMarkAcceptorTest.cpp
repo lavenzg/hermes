@@ -69,7 +69,8 @@ struct SharedMarkAcceptorTest : public ::testing::Test {
     gc.endCycle();
   }
 
-  /// One full cycle, in the order a driver must use: turn marking on, trace,
+  /// One full cycle, in the order a driver must use: turn marking on, wait for
+  /// the barriers in flight (none here: no runtime is registered), trace,
   /// certify, then sweep, all on one thread: marks are set with relaxed
   /// atomics, so program order is what makes them visible to sweep().
   void cycleFrom(SharedGCCell *root) {
