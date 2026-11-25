@@ -40,8 +40,9 @@ struct SharedMarkAcceptorTest : public ::testing::Test {
     return arr;
   }
 
+  /// Build the graph before any cycle turns marking on, so no barrier is owed.
   static void link(SharedArray *from, uint32_t i, SharedGCCell *to) {
-    from->set(i, SharedValue::encodePointer(to));
+    from->initField(i, SharedValue::encodePointer(to));
   }
 
   /// Clear the birth marks, so a cycle starts from an all-white heap. Call at
@@ -192,26 +193,6 @@ TEST_F(SharedMarkAcceptorTest, Mark_ThenSweep_SurvivesTwoCycles) {
 
   EXPECT_EQ(2u, gc.liveCellCountSlow());
   EXPECT_EQ(tail, head->at(0).getPointer());
-}
-
-TEST_F(
-    SharedMarkAcceptorTest,
-    Sweep_FreesAnUnbarrieredReferentOfABornMarkedCell) {
-  // No store barrier exists yet, so a store into a cell the marker will never
-  // trace loses the referent. Delete this test when the store barrier lands.
-  auto *b = array(1);
-  whiten();
-
-  gc.beginCycle();
-  auto *a = array(1); // born marked, therefore never traced
-  link(a, 0, b);
-
-  gc.markRoots({a});
-  EXPECT_EQ(0u, gc.drainMarkWorklist());
-  gc.endCycle();
-  gc.sweep();
-
-  EXPECT_EQ(1u, gc.liveCellCountSlow()) << "b should have been swept";
 }
 
 } // namespace

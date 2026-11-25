@@ -17,6 +17,8 @@
 namespace hermes {
 namespace vm {
 
+class SharedMutator;
+
 /// One slot in a shared cell: an element of a SharedArray today, a field of a
 /// SharedStruct later.
 class SharedValue {
@@ -61,17 +63,27 @@ class SharedValue {
     return raw_.load(std::memory_order_relaxed) != 0;
   }
 
-  /// Overwrite this slot.
+  /// Store \p v into a slot nothing else can reach yet -- a cell still being
+  /// built, before anything is allowed to trace it.
   ///
-  /// TODO: shade the overwritten value here, before the store, once SharedGC
-  /// has a barrier list to push it onto. Until then a store into a reachable
-  /// cell during a marking cycle loses what it overwrote.
-  void set(SharedValue v) {
-    // Release, to pair with the acquire in the copy constructor: a reader that
-    // follows the pointer stored here must see the cell as it was built.
+  /// No barrier, and unreachability is the whole justification: the collector
+  /// cannot have traced a cell it cannot reach. "The slot is empty, so there
+  /// is nothing to record" is *not* a second justification -- even over an
+  /// empty slot, set's store is seq_cst, and with marking on its seq_cst
+  /// pre-read runs too: together they pass the earlier writers' records on to
+  /// whoever reads the new value, and take part in the total order the barrier
+  /// relies on. This relaxed store does neither.
+  /// \pre no other thread can observe the containing cell.
+  void initField(SharedValue v) {
     raw_.store(
-        v.raw_.load(std::memory_order_relaxed), std::memory_order_release);
+        v.raw_.load(std::memory_order_relaxed), std::memory_order_relaxed);
   }
+
+  /// Overwrite this slot, recording what it held first.
+  ///
+  /// Defined in SharedMutator.h, which a caller must include: the barrier
+  /// needs the runtime's ring and the cycle counter.
+  void set(SharedValue v, SharedMutator &mutator);
 
   /// \return the cell this slot holds, or nullptr if it holds none. This does
   /// only one load to avoid TOCTTOU issue.
@@ -80,14 +92,14 @@ class SharedValue {
   /// The tracer, for one, reads the cell's mark bit next, and its kind and
   /// length if it goes on to trace it.
   SharedGCCell *getPointerOrNull() const {
-    const uint64_t raw = raw_.load(std::memory_order_acquire);
-    if (raw == 0)
-      return nullptr;
-    // memcpy to avoid an int-to-ptr compiler warning, as below.
-    const auto value = static_cast<uintptr_t>(raw);
-    SharedGCCell *ptr;
-    memcpy(&ptr, &value, sizeof(value));
-    return ptr;
+    return decodePointerOrNull(raw_.load(std::memory_order_acquire));
+  }
+
+  /// getPointerOrNull with a seq_cst load, for the store barrier's pre-read
+  /// alone; the comment on the store in SharedValue::set says why it needs
+  /// seq_cst.
+  SharedGCCell *getPointerOrNullSeqCst() const {
+    return decodePointerOrNull(raw_.load(std::memory_order_seq_cst));
   }
 
   /// \pre isPointer().
@@ -103,6 +115,17 @@ class SharedValue {
 
  private:
   explicit constexpr SharedValue(uint64_t raw) : raw_(raw) {}
+
+  /// \return the cell \p raw encodes, or nullptr if it encodes none.
+  static SharedGCCell *decodePointerOrNull(uint64_t raw) {
+    if (raw == 0)
+      return nullptr;
+    // memcpy to avoid an int-to-ptr compiler warning, as in getPointer.
+    const auto value = static_cast<uintptr_t>(raw);
+    SharedGCCell *ptr;
+    memcpy(&ptr, &value, sizeof(value));
+    return ptr;
+  }
 
   /// The encoded value. Today it's SharedGCCell pointer value.
   /// This must not be nullptr unless it's empty (uninitialized or reset).

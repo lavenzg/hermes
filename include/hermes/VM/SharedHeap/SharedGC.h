@@ -584,8 +584,16 @@ class SharedGC {
   //===--------------------------------------------------------------------===//
   // Marking. One cycle runs on one thread, between beginCycle and endCycle.
 
-  /// Create the marking state.
+  /// Create the marking state and turn marking on.
+  ///
   /// \pre no cycle is in progress.
+  /// \pre **no mutator is running.** Turning marking on is a store, not a
+  ///   handshake: a barrier that read the counter and saw marking off just
+  ///   before this can still land its store afterwards, unrecorded, and the
+  ///   cell it overwrote is then swept while still reachable.
+  ///   Making this safe against running mutators needs the collector to wait,
+  ///   after turning marking on, until no runtime is inside a barrier; until
+  ///   that exists, only tests may call this.
   void beginCycle();
 
   /// Destroy the marking state.

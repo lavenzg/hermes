@@ -68,7 +68,7 @@ TEST_F(SharedArrayTest, Create_EmptiesASlotItsPredecessorLeftDirty) {
   ASSERT_NE(nullptr, survivor);
   ASSERT_NE(nullptr, dirty);
   for (uint32_t i = 0; i < kLength; ++i)
-    dirty->set(i, SharedValue::encodePointer(survivor));
+    dirty->initField(i, SharedValue::encodePointer(survivor));
 
   // Free `dirty` but keep its segment, so the next array of this size bucket
   // reuses the slot instead of landing on a fresh mapping.
@@ -91,7 +91,7 @@ TEST_F(SharedArrayTest, SetAndGet_RoundTripAPointer) {
   ASSERT_NE(nullptr, target);
   ASSERT_NE(nullptr, arr);
 
-  arr->set(1, SharedValue::encodePointer(target));
+  arr->initField(1, SharedValue::encodePointer(target));
 
   EXPECT_TRUE(arr->at(0).isEmpty());
   EXPECT_FALSE(arr->at(1).isEmpty());
@@ -138,7 +138,7 @@ TEST_F(SharedArrayTest, Create_GivesTheCellRoomForItsElements) {
     // Touching the last element must stay inside the cell. ASan poisons the
     // slack past a slot, so this is a real bounds check.
     if (n)
-      arr->set(n - 1, SharedValue::encodePointer(arr));
+      arr->initField(n - 1, SharedValue::encodePointer(arr));
   }
 }
 

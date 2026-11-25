@@ -49,7 +49,7 @@ struct SharedCertifyTest : public RuntimeTestFixture {
   }
 
   static void link(SharedArray *from, uint32_t i, SharedGCCell *to) {
-    from->set(i, SharedValue::encodePointer(to));
+    from->initField(i, SharedValue::encodePointer(to));
   }
 
   /// Clear the birth marks, so a cycle starts from an all-white heap.

@@ -11,6 +11,7 @@
 #include "hermes/VM/HeapAlign.h"
 #include "hermes/VM/SharedHeap/SharedGC.h"
 #include "hermes/VM/SharedHeap/SharedGCCell.h"
+#include "hermes/VM/SharedHeap/SharedMutator.h"
 #include "hermes/VM/SharedHeap/SharedValue.h"
 
 #include "llvh/Support/TrailingObjects.h"
@@ -89,9 +90,20 @@ class SharedArray final
     return data()[i];
   }
 
-  void set(uint32_t i, SharedValue v) {
+  /// Store into element \p i of an array nothing else can reach yet.
+  /// \pre no other thread can observe this array.
+  void initField(uint32_t i, SharedValue v) {
     assert(i < length_ && "index out of range");
-    data()[i].set(v);
+    // The checkable half of the precondition. An initField over a slot that
+    // already holds something is the shape a barrier violation takes.
+    assert(data()[i].isEmpty() && "initField over a live slot");
+    data()[i].initField(v);
+  }
+
+  /// Overwrite element \p i, recording what it held first.
+  void set(uint32_t i, SharedValue v, SharedMutator &mutator) {
+    assert(i < length_ && "index out of range");
+    data()[i].set(v, mutator);
   }
 
   /// Elements are contiguous, so a tracer walks length() of them from here.

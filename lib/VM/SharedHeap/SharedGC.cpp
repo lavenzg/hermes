@@ -620,6 +620,14 @@ bool SharedGC::certifyRound() {
     return false;
 
   std::lock_guard<std::mutex> lk(barrierMtx_);
+  // No fence is needed before the drains. The trace read every slot with an
+  // acquire load, a barrier's slot store releases the push made before it,
+  // and the next writer's pre-read acquires that store in turn. So every push
+  // made before the value the trace read, along the chain of writers to that
+  // slot, is already visible here. The lock's acquire could not stand in for
+  // the trace's: a barrier does not take this lock on its fast path, so there
+  // is no release of it to pair with.
+  //
   // Rings drain into the same worklist, so the two halves are one observation
   // rather than two checks a spill could slip between.
   std::vector<SharedGCCell *> &worklist = markState_->barrierWorklist;

@@ -65,8 +65,8 @@ TEST_F(SharedSlotVisitorTest, MarkCell_YieldsEveryPointerInAddressOrder) {
   auto *a = array(1);
   auto *b = array(1);
   auto *arr = array(4);
-  arr->set(0, SharedValue::encodePointer(a));
-  arr->set(2, SharedValue::encodePointer(b));
+  arr->initField(0, SharedValue::encodePointer(a));
+  arr->initField(2, SharedValue::encodePointer(b));
 
   RecordingAcceptor rec;
   SharedGC::markCell(rec, arr);
@@ -106,7 +106,7 @@ TEST_F(SharedSlotVisitorTest, MarkCell_WalksLengthNotStride) {
   auto *keep = array(kLength);
   auto *filler = array(maxElems);
   for (uint32_t i = 0; i < maxElems; ++i)
-    filler->set(i, SharedValue::encodePointer(keep));
+    filler->initField(i, SharedValue::encodePointer(keep));
 
   gc.sweep(); // clears the birth marks
   SharedGC::setCellMarkBit(keep);
@@ -120,7 +120,7 @@ TEST_F(SharedSlotVisitorTest, MarkCell_WalksLengthNotStride) {
   ASSERT_EQ(static_cast<void *>(filler), static_cast<void *>(arr))
       << "wanted the filler's recycled slot, so the slack is dirty";
   for (uint32_t i = 0; i < kLength; ++i)
-    arr->set(i, SharedValue::encodePointer(keep));
+    arr->initField(i, SharedValue::encodePointer(keep));
 
   RecordingAcceptor rec;
   SharedGC::markCell(rec, arr);
