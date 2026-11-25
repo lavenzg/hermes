@@ -95,6 +95,7 @@ namespace vm {
 class BoxedSharedObject;
 class SharedGC;
 class SharedMutator;
+class SharedValue;
 class CodeBlock;
 class Environment;
 class Interpreter;
@@ -581,6 +582,48 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// Record \p box as this runtime's box for \p cell.
   /// \pre there is no live box for \p cell.
   void setBoxForSharedCell(SharedGCCell *cell, Handle<BoxedSharedObject> box);
+
+  /// The points in materializeSharedSlot where a test can step in.
+  enum class MaterializeStep {
+    /// The hit check missed and the box is allocated. The prune has not run,
+    /// and no window is open.
+    BeforeWindow,
+    /// Inside the window, before the test of the marking flag.
+    AfterEntry,
+    /// Inside the window, between the test of the marking flag and the read.
+    AfterTest,
+    /// Inside the window, after the read, before the push and the publish.
+    AfterRead,
+    /// Inside the window, after any publish, just before the window closes.
+    BeforeExit,
+  };
+
+  /// \return this runtime's box for the cell \p slot holds, made and recorded
+  ///   if it has none yet, or an empty PseudoHandle if \p slot holds no cell.
+  ///
+  /// How a runtime takes hold of a shared cell it did not allocate: once the
+  /// slot changes, the box's key is what keeps the cell alive. \p slot is
+  /// read in place rather than copied, because the read that is published has
+  /// to happen inside a barrier window.
+  ///
+  /// \pre this runtime is attached to a shared heap and is not inside a
+  ///   barrier window, neither the shared heap's allocation lock nor this
+  ///   runtime's map lock is held, and the cell containing \p slot stays alive
+  ///   while a box is made here, which can run a local GC. Holding that cell's
+  ///   box is how a caller makes sure of it.
+  PseudoHandle<BoxedSharedObject> materializeSharedSlot(
+      const SharedValue &slot) {
+    return materializeSharedSlotImpl(slot, nullptr);
+  }
+
+#ifdef UNIT_TEST
+  /// materializeSharedSlot, calling \p hook at each MaterializeStep.
+  PseudoHandle<BoxedSharedObject> materializeSharedSlot(
+      const SharedValue &slot,
+      const std::function<void(MaterializeStep)> &hook) {
+    return materializeSharedSlotImpl(slot, &hook);
+  }
+#endif
 
   /// Append every shared cell this runtime names to \p out -- its contribution
   /// to the shared heap's root set. Includes keys whose box has died but has
@@ -1403,6 +1446,12 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// \pre neither the shared heap's allocation lock nor this map's lock is
   ///   held.
   void pruneSharedObjectBoxes();
+
+  /// The body of materializeSharedSlot, calling \p hook, if there is one, at
+  /// each MaterializeStep.
+  PseudoHandle<BoxedSharedObject> materializeSharedSlotImpl(
+      const SharedValue &slot,
+      const std::function<void(MaterializeStep)> *hook);
 #endif
 
  private:

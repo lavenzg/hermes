@@ -917,6 +917,74 @@ void Runtime::setBoxForSharedCell(
   sharedObjectBoxes_[cell].set(*this, *box);
 }
 
+PseudoHandle<BoxedSharedObject> Runtime::materializeSharedSlotImpl(
+    const SharedValue &slot,
+    const std::function<void(MaterializeStep)> *hook) {
+  assert(sharedMutator_ && "only an attached runtime reads shared slots");
+  auto step = [hook](MaterializeStep s) {
+    if (LLVM_UNLIKELY(hook))
+      (*hook)(s);
+  };
+
+  // The hit check, outside any window. What it reads is only a key: with no
+  // window open, another runtime can overwrite the slot unrecorded and a cycle
+  // can then free the cell, so it is never followed. A live key's cell cannot
+  // have been freed, and nothing between the read and the lookup allocates, so
+  // a hit is the box for the value read, and its key already protects the
+  // cell.
+  SharedGCCell *key = slot.getPointerOrNull();
+  if (!key)
+    return PseudoHandle<BoxedSharedObject>{};
+  if (BoxedSharedObject *hit = findBoxForSharedCell(key))
+    return PseudoHandle<BoxedSharedObject>::create(hit);
+
+  // The box first, outside any window: making it can run a local GC, and the
+  // collector would wait through that GC for a window open across it.
+  struct : public Locals {
+    PinnedValue<BoxedSharedObject> box;
+  } lv;
+  LocalsRAII lraii(*this, &lv);
+  lv.box = BoxedSharedObject::create(*this);
+  step(MaterializeStep::BeforeWindow);
+  // Before the window, not at the lookup inside it, which would otherwise walk
+  // the whole map with the window open for what that allocation found dead.
+  pruneSharedObjectBoxesIfNeeded();
+
+  // A whole cycle can pass between the hit check and here, so only the read
+  // inside the window is used. It must follow the seq_cst test: a test that
+  // reads the in-flight check's second-pass write, or a later value,
+  // synchronizes with it, so the read cannot return a value overwritten by a
+  // store whose barrier tested the flag before marking turned on. The read is
+  // an acquire, since whoever holds the box follows it to the cell.
+  sharedMutator_->enterBarrier();
+  step(MaterializeStep::AfterEntry);
+  const uint32_t seq = sharedGC_->cycleSeq();
+  step(MaterializeStep::AfterTest);
+  SharedGCCell *cell = slot.getPointerOrNull();
+  step(MaterializeStep::AfterRead);
+  if (!cell) {
+    lv.box = nullptr;
+  } else {
+    // Before any map lock: a push can spill, which takes the barrier mutex,
+    // and the root scan takes that before a map lock. The cell's key,
+    // published below or already in the map, is what protects it; the push is
+    // insurance.
+    if (seq % 2 == 1)
+      sharedMutator_->push(cell, seq);
+    if (BoxedSharedObject *hit = findBoxForSharedCell(cell)) {
+      lv.box = hit;
+    } else {
+      // Before the window closes, so a pass of the in-flight check that waits
+      // for this window, or finds it closed, also finds the key.
+      lv.box->setSharedCell(cell);
+      setBoxForSharedCell(cell, lv.box);
+    }
+  }
+  step(MaterializeStep::BeforeExit);
+  sharedMutator_->exitBarrier();
+  return PseudoHandle<BoxedSharedObject>::create(*lv.box);
+}
+
 void Runtime::appendSharedRootKeys(std::vector<SharedGCCell *> &out) const {
   std::lock_guard<std::mutex> lk(sharedObjectBoxesMtx_);
   appendSharedRootKeysUnlocked(out);

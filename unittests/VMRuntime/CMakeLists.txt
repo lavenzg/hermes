@@ -94,6 +94,7 @@ if(HERMES_ENABLE_SHARED_HEAP)
     SharedGCTest.cpp
     SharedInFlightTest.cpp
     SharedMarkAcceptorTest.cpp
+    SharedMaterializeTest.cpp
     SharedMutatorTest.cpp
     SharedObjectBoxMapTest.cpp
     SharedRootScanTest.cpp
