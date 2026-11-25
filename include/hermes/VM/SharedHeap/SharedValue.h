@@ -61,6 +61,18 @@ class SharedValue {
     return raw_.load(std::memory_order_relaxed) != 0;
   }
 
+  /// Overwrite this slot.
+  ///
+  /// TODO: shade the overwritten value here, before the store, once SharedGC
+  /// has a barrier list to push it onto. Until then a store into a reachable
+  /// cell during a marking cycle loses what it overwrote.
+  void set(SharedValue v) {
+    // Release, to pair with the acquire in the copy constructor: a reader that
+    // follows the pointer stored here must see the cell as it was built.
+    raw_.store(
+        v.raw_.load(std::memory_order_relaxed), std::memory_order_release);
+  }
+
   /// \pre isPointer().
   SharedGCCell *getPointer() const {
     assert(isPointer() && "slot holds no pointer");
