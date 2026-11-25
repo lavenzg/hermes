@@ -537,6 +537,16 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// not the map's.
   BoxedSharedObject *findBoxForSharedCell(SharedGCCell *cell);
 
+  /// Run pruneSharedObjectBoxes if a local GC has found a box dead since the
+  /// last prune. The lookup does this first, and so does each operation that
+  /// allocates a box, between that allocation and its insert, so that a
+  /// runtime which never looks anything up still lets go of cells it no
+  /// longer holds.
+  void pruneSharedObjectBoxesIfNeeded() {
+    if (LLVM_UNLIKELY(sharedObjectBoxesNeedPrune_))
+      pruneSharedObjectBoxes();
+  }
+
   /// Record \p box as this runtime's box for \p cell.
   /// \pre there is no live box for \p cell.
   void setBoxForSharedCell(SharedGCCell *cell, Handle<BoxedSharedObject> box);
@@ -1489,10 +1499,10 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   mutable std::mutex sharedObjectBoxesMtx_;
 
   /// Set when a weak-root pass nulled at least one entry above. The sweep
-  /// happens on the next lookup rather than in the pass itself. This
-  /// separates the shared heap related logic from the local heap marking. The
-  /// cost of erasing null entries is only added to lookup of this map, which
-  /// is out of normal JS execution.
+  /// happens on the next lookup or box allocation rather than in the pass
+  /// itself. This separates the shared heap related logic from the local heap
+  /// marking. The cost of erasing null entries is only added to those
+  /// operations on this map, which are out of normal JS execution.
   bool sharedObjectBoxesNeedPrune_{false};
 #endif // HERMES_ENABLE_SHARED_HEAP
 

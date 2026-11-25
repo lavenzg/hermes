@@ -32,6 +32,11 @@
 namespace hermes {
 namespace vm {
 
+class BoxedSharedObject;
+class Runtime;
+template <typename T>
+class PseudoHandle;
+
 /// A heap shared by several Runtimes on several threads, holding cells that
 /// outlive any one Runtime.
 ///
@@ -394,7 +399,11 @@ class SharedGC {
   //===--------------------------------------------------------------------===//
   // Allocation and collection
 
+#ifdef UNIT_TEST
   /// Allocate \p size bytes and construct a \p T into them with \p args.
+  /// Test-only: the cell is in no runtime's box map, the collector's root set,
+  /// so nothing keeps it alive. Production code allocates with makeBoxed.
+  ///
   /// **mtx_ is held across T's constructor.** That is what keeps a slot which
   /// is allocated and marked, but not yet a cell, invisible to anything that
   /// walks the heap. It constrains T in exchange: its constructor must not
@@ -411,6 +420,41 @@ class SharedGC {
     std::lock_guard<std::mutex> lk(mtx_);
     return makeALocked<T>(*alignedSize, std::forward<Args>(args)...);
   }
+#endif
+
+  /// Allocate a shared cell and its box together, publishing the pair into
+  /// \p runtime's map before the allocation lock is released.
+  ///
+  /// The publish has to be inside that lock. A collection's bulk reset takes
+  /// the same one, so holding it from the allocation through the insert is what
+  /// makes a collection either see the cell in the map -- the root set it marks
+  /// -- or not have started yet. Outside it, the cell exists for a window in no
+  /// map at all: the reset whitens it, the root scan misses it, and it is swept
+  /// while its runtime is one instruction from publishing it.
+  ///
+  /// The box is allocated **first**, deliberately. It is the only step here
+  /// that can trigger a local GC, so doing it before the lock is what leaves
+  /// the critical section free of anything that allocates. T's constructor
+  /// also runs under the lock, with the constraints listed on makeA.
+  ///
+  /// Between the box and the lock, \p runtime's map is pruned, as a lookup
+  /// would: a runtime that only ever allocates would otherwise keep every key
+  /// whose box has died, and with it the cell.
+  ///
+  /// \pre \p runtime belongs to the calling thread. This is the one entry
+  ///   point here that touches per-runtime state: a local-heap allocation and a
+  ///   map that is not thread-safe.
+  /// \return the box, or an empty PseudoHandle if \p size exceeds
+  ///   maxCellSize(), the budget is exhausted, or the mapping fails. The box
+  ///   allocated for a failed attempt is simply garbage. The map holds the box
+  ///   only weakly, so it is the caller that must root it.
+  ///
+  /// Declared here and defined in SharedGCBoxing-inline.h, which callers must
+  /// include: the definition needs Runtime and BoxedSharedObject complete, and
+  /// this header deliberately knows about neither.
+  template <typename T, typename... Args>
+  PseudoHandle<BoxedSharedObject>
+  makeBoxed(Runtime &runtime, uint32_t size, Args &&...args);
 
 #ifndef NDEBUG
   uint32_t nextDebugAllocationId() {

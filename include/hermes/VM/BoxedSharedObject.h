@@ -31,13 +31,24 @@ class BoxedSharedObject final : public JSObject {
     return cell->getKind() == CellKind::BoxedSharedObjectKind;
   }
 
-  /// Create a box, optionally bound to \p cell.
+  /// Create a box bound to no cell yet. Whoever creates it binds it with
+  /// setSharedCell and records it in the runtime's map.
   /// The parent is null, and a box is not extensible, so it stays null. That
   /// is what the shared struct spec requires anyway, and it is also what keeps
   /// a box clear of the negative-match cache.
+  static PseudoHandle<BoxedSharedObject> create(Runtime &runtime) {
+    return createImpl(runtime, nullptr);
+  }
+
+#ifdef UNIT_TEST
+  /// Create a box already bound to \p cell. Test-only: the box is in no map,
+  /// so it does not make its cell a root.
   static PseudoHandle<BoxedSharedObject> create(
       Runtime &runtime,
-      SharedGCCell *cell = nullptr);
+      SharedGCCell *cell) {
+    return createImpl(runtime, cell);
+  }
+#endif
 
   /// \return the shared cell this box stands for, or null if it is not bound
   /// yet.
@@ -61,6 +72,11 @@ class BoxedSharedObject final : public JSObject {
       : JSObject(runtime, nullptr, *clazz), sharedCell_(cell) {}
 
  private:
+  /// The body of both create overloads.
+  static PseudoHandle<BoxedSharedObject> createImpl(
+      Runtime &runtime,
+      SharedGCCell *cell);
+
   /// Raw pointer to the cell in the shared heap. Local GC will not trace this.
   /// Instead, it's provided as roots to the collector of the shared heap. It
   /// can never be invalid as long as this boxed object is alive.

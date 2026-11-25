@@ -831,8 +831,7 @@ BoxedSharedObject *Runtime::findBoxForSharedCell(SharedGCCell *cell) {
   // without the assert an unbound box's getSharedCell() passed in here reads
   // as a clean miss and the caller boxes the cell a second time.
   assert(cell && "a box stands for a cell");
-  if (LLVM_UNLIKELY(sharedObjectBoxesNeedPrune_))
-    pruneSharedObjectBoxes();
+  pruneSharedObjectBoxesIfNeeded();
   auto it = sharedObjectBoxes_.find(cell);
   if (it == sharedObjectBoxes_.end())
     return nullptr;

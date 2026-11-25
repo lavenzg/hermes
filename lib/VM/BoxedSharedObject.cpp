@@ -41,7 +41,7 @@ const ObjectVTable BoxedSharedObject::vt{
     BoxedSharedObject::_checkAllOwnIndexedImpl,
 };
 
-PseudoHandle<BoxedSharedObject> BoxedSharedObject::create(
+PseudoHandle<BoxedSharedObject> BoxedSharedObject::createImpl(
     Runtime &runtime,
     SharedGCCell *cell) {
   auto *box = runtime.makeAFixed<BoxedSharedObject>(
