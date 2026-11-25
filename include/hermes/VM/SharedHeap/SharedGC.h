@@ -570,6 +570,9 @@ class SharedGC {
   /// \pre \p runtime belongs to the calling thread. This is the one entry
   ///   point here that touches per-runtime state: a local-heap allocation and a
   ///   map that is not thread-safe.
+  /// \pre \p runtime is attached to this heap. The root scan reads only
+  ///   attached runtimes' maps, so a key published into any other map does
+  ///   not keep its cell.
   /// \return the box, or an empty PseudoHandle if \p size exceeds
   ///   maxCellSize(), the budget is exhausted, or the mapping fails. The box
   ///   allocated for a failed attempt is simply garbage. The map holds the box

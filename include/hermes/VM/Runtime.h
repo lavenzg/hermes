@@ -93,6 +93,8 @@ namespace vm {
 
 // External forward declarations.
 class BoxedSharedObject;
+class SharedGC;
+class SharedMutator;
 class CodeBlock;
 class Environment;
 class Interpreter;
@@ -247,7 +249,25 @@ class RuntimeBase : public SHRuntime {
 /// exist and are completely independent from each other.
 class Runtime : public RuntimeBase, public HandleRootOwner {
  public:
-  static std::shared_ptr<Runtime> create(const RuntimeConfig &runtimeConfig);
+#ifdef HERMES_ENABLE_SHARED_HEAP
+  /// The shared heap a runtime can be created in.
+  using SharedGCPtr = std::shared_ptr<SharedGC>;
+#else
+  /// Without the shared heap, the only shared heap a runtime can be created in
+  /// is none.
+  using SharedGCPtr = std::nullptr_t;
+#endif
+
+  /// \param sharedGC the shared heap this runtime participates in, or null
+  ///   for a runtime with no shared heap.
+  ///   Passed at construction rather than attached later so that a runtime is
+  ///   registered with the collector before any user JS runs -- an
+  ///   unregistered runtime's stores are unbarriered, so a runtime attaching
+  ///   mid-cycle must be registered first. Internal JS runs earlier, but
+  ///   cannot reach a shared cell.
+  static std::shared_ptr<Runtime> create(
+      const RuntimeConfig &runtimeConfig,
+      SharedGCPtr sharedGC = nullptr);
 
   ~Runtime();
 
@@ -545,6 +565,13 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   void pruneSharedObjectBoxesIfNeeded() {
     if (LLVM_UNLIKELY(sharedObjectBoxesNeedPrune_))
       pruneSharedObjectBoxes();
+  }
+
+  /// \return whether this runtime is attached to \p sharedGC: created with it
+  ///   and not yet detached by its post-shutdown deleter. Only an attached
+  ///   runtime's map is in that heap's root set.
+  bool isAttachedTo(const SharedGC &sharedGC) const {
+    return sharedGC_.get() == &sharedGC && sharedMutator_;
   }
 
   /// Record \p box as this runtime's box for \p cell.
@@ -1277,7 +1304,8 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
 
   explicit Runtime(
       std::shared_ptr<StorageProvider> provider,
-      const RuntimeConfig &runtimeConfig);
+      const RuntimeConfig &runtimeConfig,
+      SharedGCPtr sharedGC = nullptr);
 
   /// Generate a bytecode buffer that contains a few special functions:
   /// 0) an empty function that returns undefined.
@@ -1512,6 +1540,20 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
   /// Lock order: the shared heap's allocation lock, then this. Never the
   /// reverse, and never this then the shared heap's barrier mutex.
   mutable std::mutex sharedObjectBoxesMtx_;
+
+  /// The shared heap this runtime participates in, or null. Held by
+  /// shared_ptr so that the heap cannot be destroyed while this runtime is
+  /// attached to it.
+  std::shared_ptr<SharedGC> sharedGC_;
+
+  /// This runtime's registration with sharedGC_, or null when there is no
+  /// shared heap. Its constructor registers and its destructor unregisters,
+  /// so its lifetime *is* the attachment.
+  ///
+  /// unique_ptr rather than Optional so that Runtime.h needs only a forward
+  /// declaration: SharedMutator.h pulls in SharedGC.h, which has no business
+  /// in the include graph of every file that sees a Runtime.
+  std::unique_ptr<SharedMutator> sharedMutator_;
 
   /// Set when a weak-root pass nulled at least one entry above. The sweep
   /// happens on the next lookup or box allocation rather than in the pass

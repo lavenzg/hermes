@@ -47,6 +47,7 @@
 
 #ifdef HERMES_ENABLE_SHARED_HEAP
 #include "hermes/VM/BoxedSharedObject.h"
+#include "hermes/VM/SharedHeap/SharedMutator.h"
 #endif
 
 #ifdef HERMESVM_INTERNAL_JAVASCRIPT_NATIVE
@@ -120,10 +121,11 @@ static const Predefined::Str fixedPropCacheNames[(size_t)PropCacheID::_COUNT] =
 // hold the Runtime.
 class Runtime::StackRuntime {
  public:
-  StackRuntime(const vm::RuntimeConfig &runtimeConfig)
+  StackRuntime(const vm::RuntimeConfig &runtimeConfig, SharedGCPtr sharedGC)
       : thread_(runtimeMemoryThread, this) {
     startup_.get_future().get();
-    new (runtime_) Runtime(StorageProvider::mmapProvider(), runtimeConfig);
+    new (runtime_) Runtime(
+        StorageProvider::mmapProvider(), runtimeConfig, std::move(sharedGC));
   }
 
   ~StackRuntime() {
@@ -132,8 +134,11 @@ class Runtime::StackRuntime {
     thread_.join();
   }
 
-  static std::shared_ptr<Runtime> create(const RuntimeConfig &runtimeConfig) {
-    auto srt = std::make_shared<StackRuntime>(runtimeConfig);
+  static std::shared_ptr<Runtime> create(
+      const RuntimeConfig &runtimeConfig,
+      SharedGCPtr sharedGC) {
+    auto srt =
+        std::make_shared<StackRuntime>(runtimeConfig, std::move(sharedGC));
     return std::shared_ptr<Runtime>(srt, srt->runtime_);
   }
 
@@ -158,7 +163,9 @@ class Runtime::StackRuntime {
 };
 
 /* static */
-std::shared_ptr<Runtime> Runtime::create(const RuntimeConfig &runtimeConfig) {
+std::shared_ptr<Runtime> Runtime::create(
+    const RuntimeConfig &runtimeConfig,
+    SharedGCPtr sharedGC) {
 #if defined(HERMESVM_CONTIGUOUS_HEAP) && defined(HERMESVM_RUNTIME_ON_STACK)
 #error Contiguous heap is not compatible with Runtime on stack.
 #endif
@@ -171,13 +178,13 @@ std::shared_ptr<Runtime> Runtime::create(const RuntimeConfig &runtimeConfig) {
   std::shared_ptr<StorageProvider> sp =
       StorageProvider::contiguousVAProvider(providerSize);
   auto rt = HeapRuntime<Runtime>::create(sp);
-  new (rt.get()) Runtime(std::move(sp), runtimeConfig);
+  new (rt.get()) Runtime(std::move(sp), runtimeConfig, std::move(sharedGC));
   return rt;
 #elif defined(HERMESVM_RUNTIME_ON_STACK)
-  return StackRuntime::create(runtimeConfig);
+  return StackRuntime::create(runtimeConfig, std::move(sharedGC));
 #else
-  return std::shared_ptr<Runtime>{
-      new Runtime(StorageProvider::mmapProvider(), runtimeConfig)};
+  return std::shared_ptr<Runtime>{new Runtime(
+      StorageProvider::mmapProvider(), runtimeConfig, std::move(sharedGC))};
 #endif
 }
 
@@ -281,7 +288,8 @@ void RuntimeBase::registerHeapSegment(unsigned idx, void *lowLim) {
 
 Runtime::Runtime(
     std::shared_ptr<StorageProvider> provider,
-    const RuntimeConfig &runtimeConfig)
+    const RuntimeConfig &runtimeConfig,
+    SharedGCPtr sharedGC)
     // The initial heap size can't be larger than the max.
     : // thrownValue_ is Empty when there is no value currently being thrown.
       thrownValue_(HermesValue::encodeEmptyValue()),
@@ -491,6 +499,24 @@ Runtime::Runtime(
   if (runtimeConfig.getEnableSampleProfiling())
     samplingProfiler = SamplingProfiler::create(*this);
 #endif // HERMESVM_SAMPLING_PROFILER_AVAILABLE
+
+#ifdef HERMES_ENABLE_SHARED_HEAP
+  // Last, and in the body rather than the initialiser list: registering
+  // publishes this runtime to the collector, which may immediately read its
+  // box map from another thread, so everything it can reach has to be built
+  // first. Internal JS has already run by now, which is harmless: it cannot
+  // reach a shared cell, so it cannot run a barrier.
+  //
+  // Deregistration goes in a post-shutdown deleter, not a shutdown callback.
+  // ~Runtime runs the callbacks first and they may "allocate, call into JS,
+  // and trigger GC", so dropping there could be followed by more
+  // materialisation into a map the collector no longer scans.
+  sharedGC_ = std::move(sharedGC);
+  if (sharedGC_) {
+    sharedMutator_ = std::make_unique<SharedMutator>(*sharedGC_, *this);
+    addPostShutdownDeleter([this] { sharedMutator_.reset(); });
+  }
+#endif
 
   LLVM_DEBUG(llvh::dbgs() << "Runtime initialized\n");
 }

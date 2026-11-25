@@ -12,6 +12,8 @@
 #include "VMRuntimeTestHelpers.h"
 #include "gtest/gtest.h"
 
+#include <memory>
+
 using namespace hermes::vm;
 
 namespace {
@@ -51,9 +53,26 @@ struct DrainGuard {
   }
 };
 
-struct SharedGCBoxingTest : public RuntimeTestFixture {
-  SharedGC gc{kAmpleBudget};
-  DrainGuard drainGc{gc};
+/// A shared heap and a runtime attached to it, as makeBoxed requires.
+/// Destroyed in reverse order, so the runtime detaches before the heap is
+/// drained.
+struct AttachedRuntime {
+  std::shared_ptr<SharedGC> heap;
+  SharedGC &gc{*heap};
+  DrainGuard drain{gc};
+  std::shared_ptr<Runtime> rt{Runtime::create(kTestRTConfig, heap)};
+  Runtime &runtime{*rt};
+  GCScope gcScope{runtime};
+
+  explicit AttachedRuntime(size_t budget)
+      : heap(std::make_shared<SharedGC>(budget)) {}
+};
+
+struct SharedGCBoxingTest : public ::testing::Test {
+  AttachedRuntime ample{kAmpleBudget};
+  SharedGC &gc{ample.gc};
+  Runtime &runtime{ample.runtime};
+  GCScope &gcScope{ample.gcScope};
 };
 
 TEST_F(SharedGCBoxingTest, MakeBoxed_ReturnsABoxBoundToTheNewCell) {
@@ -149,18 +168,17 @@ TEST_F(SharedGCBoxingTest, MakeBoxed_IsEmptyWhenTheBudgetIsExhausted) {
   // The other failure path: the request is servable in principle, so the box is
   // allocated, and only then does the cell allocation fail. The box is dropped
   // on the floor as garbage and nothing is published.
-  SharedGC small{SharedGC::kSegmentSize};
-  DrainGuard drainSmall{small};
+  AttachedRuntime small{SharedGC::kSegmentSize};
 
-  auto first = runtime.makeHandle(
-      small.makeBoxed<TestCell>(runtime, sizeof(TestCell), 1u, 0u));
+  auto first = small.runtime.makeHandle(
+      small.gc.makeBoxed<TestCell>(small.runtime, sizeof(TestCell), 1u, 0u));
   EXPECT_TRUE(*first);
-  EXPECT_EQ(1u, runtime.sharedObjectBoxCountSlow());
+  EXPECT_EQ(1u, small.runtime.sharedObjectBoxCountSlow());
 
   // A second size bucket would need a second segment, which the budget refuses.
-  EXPECT_FALSE(small.makeBoxed<TestCell>(
-      runtime, SharedGC::SizeBuckets::kMaxBucketSize, 2u, 0u));
-  EXPECT_EQ(1u, runtime.sharedObjectBoxCountSlow())
+  EXPECT_FALSE(small.gc.makeBoxed<TestCell>(
+      small.runtime, SharedGC::SizeBuckets::kMaxBucketSize, 2u, 0u));
+  EXPECT_EQ(1u, small.runtime.sharedObjectBoxCountSlow())
       << "a failed allocation published something";
 }
 
@@ -171,19 +189,18 @@ TEST_F(SharedGCBoxingTest, MakeBoxed_ConsumesNoHandleSlotOfTheCallers) {
   // calls this repeatedly, and a slot allocated in the caller's scope is
   // reclaimed only when that scope ends -- so each rejected attempt would pin
   // one more dead, unbound box.
-  SharedGC small{SharedGC::kSegmentSize};
-  DrainGuard drainSmall{small};
-  auto first = runtime.makeHandle(
-      small.makeBoxed<TestCell>(runtime, sizeof(TestCell), 1u, 0u));
+  AttachedRuntime small{SharedGC::kSegmentSize};
+  auto first = small.runtime.makeHandle(
+      small.gc.makeBoxed<TestCell>(small.runtime, sizeof(TestCell), 1u, 0u));
   ASSERT_TRUE(*first);
 
-  const size_t before = gcScope.getHandleCountDbg();
+  const size_t before = small.gcScope.getHandleCountDbg();
   for (int i = 0; i < 16; ++i) {
     // Servable in principle, so a box is allocated before the cell fails.
-    EXPECT_FALSE(small.makeBoxed<TestCell>(
-        runtime, SharedGC::SizeBuckets::kMaxBucketSize, 2u, 0u));
+    EXPECT_FALSE(small.gc.makeBoxed<TestCell>(
+        small.runtime, SharedGC::SizeBuckets::kMaxBucketSize, 2u, 0u));
   }
-  EXPECT_EQ(before, gcScope.getHandleCountDbg())
+  EXPECT_EQ(before, small.gcScope.getHandleCountDbg())
       << "makeBoxed pinned a slot in the caller's scope";
 }
 #endif

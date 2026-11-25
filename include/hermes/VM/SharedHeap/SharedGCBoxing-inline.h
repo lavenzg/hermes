@@ -18,6 +18,9 @@ namespace vm {
 template <typename T, typename... Args>
 PseudoHandle<BoxedSharedObject>
 SharedGC::makeBoxed(Runtime &runtime, uint32_t size, Args &&...args) {
+  assert(
+      runtime.isAttachedTo(*this) &&
+      "only an attached runtime's map is in this heap's root set");
   // Checked before the box is allocated, so a request that cannot be served
   // does not cost one.
   const OptValue<uint32_t> alignedSize = checkedAlignedSize<T>(size);
