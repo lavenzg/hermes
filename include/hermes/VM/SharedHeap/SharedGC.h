@@ -12,6 +12,8 @@
 #include "hermes/VM/HeapAlign.h"
 #include "hermes/VM/SharedHeap/SharedGCCell.h"
 
+#include "llvh/ADT/ArrayRef.h"
+#include "llvh/ADT/Optional.h"
 #include "llvh/ADT/ilist_node.h"
 #include "llvh/ADT/simple_ilist.h"
 #include "llvh/Support/MathExtras.h"
@@ -26,8 +28,10 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <stack>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace hermes {
 namespace vm {
@@ -162,6 +166,10 @@ class SharedGC {
   /// it concurrently.
   /// 2. Array for allocation bits. It's non-atomic since allocation is
   /// protected by \c mtx_.
+  /// The standard segment size is kSegmentSize, and it allows allocating cells
+  /// with a given bucket size. For cell whose size is larger than kSegmentSize
+  /// (minus the header size), it spans over multiple standard segments. And the
+  /// single cell occupies the entire segment.
   class SegmentHeader : public llvh::ilist_node<SegmentHeader> {
    public:
 #ifndef NDEBUG
@@ -343,6 +351,24 @@ class SharedGC {
   bool sweepRegion(SegmentHeader *hdr);
 
   //===--------------------------------------------------------------------===//
+  // Marking
+
+  class MarkAcceptor;
+
+  /// State that exists only while a marking cycle is running.
+  ///
+  /// A mutator can neither name this nor reach anything it owns, which is what
+  /// makes it safe to destroy while barriers are running. Adding an accessor
+  /// for markState_, or moving a barrier-reachable structure in here, breaks
+  /// that.
+  struct MarkState {
+    /// Local to the marking thread, unlike the barrier worklist a runtime
+    /// spills into, so no lock and no atomics. Peak size is bounded by the
+    /// number of cells in the shared heap.
+    std::stack<SharedGCCell *, std::vector<SharedGCCell *>> localWorklist;
+  };
+
+  //===--------------------------------------------------------------------===//
   // State
 
   /// Guards every allocator-side structure.
@@ -362,6 +388,10 @@ class SharedGC {
   const size_t maxSize_;
   std::atomic<size_t> footprint_{0};
   std::atomic<bool> markingBarriers_{false};
+
+  /// An Optional so it can be created and destroyed at the start and end of
+  /// marking. Deliberately has no accessor; see MarkState.
+  llvh::Optional<MarkState> markState_;
 
 #ifndef NDEBUG
   /// Shared across the group: GCBase::nextObjectID is per-Runtime and would
@@ -487,6 +517,34 @@ class SharedGC {
     return released;
   }
 #endif
+
+  //===--------------------------------------------------------------------===//
+  // Marking. One cycle runs on one thread, between beginCycle and endCycle.
+
+  /// Create the marking state.
+  /// \pre no cycle is in progress.
+  void beginCycle();
+
+  /// Destroy the marking state. Turning marking off and sweeping are the
+  /// driver's job, on the thread that traced: marks are set with relaxed
+  /// atomics, so program order is what makes them visible to sweep().
+  /// \pre a cycle is in progress and nothing is left to trace.
+  void endCycle();
+
+  /// Mark each of \p roots and enqueue it for tracing. Already-marked roots
+  /// are skipped.
+  /// \pre a cycle is in progress, and every root is a live cell in a shared
+  ///   segment.
+  void markRoots(llvh::ArrayRef<SharedGCCell *> roots);
+
+  /// Trace until the mark worklist is empty.
+  ///
+  /// Unbudgeted, unlike HadesGC::incrementalMark: markLimit bounds how long
+  /// Hades's marker holds gcMutex_, and this one holds no lock.
+  ///
+  /// \pre a cycle is in progress, on the thread that began tracing it.
+  /// \return the number of cells traced.
+  size_t drainMarkWorklist();
 
   //===--------------------------------------------------------------------===//
   // Mark bits. Reachability is not this class's concern: these are the

@@ -6,7 +6,9 @@
  */
 
 #include "hermes/VM/SharedHeap/SharedGC.h"
+#include "hermes/Support/Compiler.h"
 #include "hermes/Support/OSCompat.h"
+#include "hermes/VM/SharedHeap/SharedGC-inline.h"
 
 #include <iterator>
 #include <limits>
@@ -344,6 +346,69 @@ size_t SharedGC::sweep() {
   sweeping_.store(false, std::memory_order_relaxed);
 #endif
   return released;
+}
+
+/// Internal linkage records that this file is the only user, and lets the
+/// compiler inline accept() into the drain loop below.
+class HERMES_ATTRIBUTE_INTERNAL_LINKAGE SharedGC::MarkAcceptor final {
+ public:
+  explicit MarkAcceptor(SharedGC &gc) : gc_(gc) {}
+
+  /// Mark and enqueue \p cell unless it is already marked. Every source -- a
+  /// slot from SharedSlotVisitor, a root, an entry off a barrier ring --
+  /// arrives here.
+  /// \return true if this call marked \p cell.
+  bool accept(SharedGCCell *cell) {
+    // A load then an unconditional set, never a test-and-set: this thread is
+    // the only marker, and black allocation only ever sets a different cell's
+    // bit.
+    //
+    // A cell born during the cycle is already marked and stops here. It is
+    // never traced, so its outgoing edges rest on every shared reference
+    // having been pushed before it could be stored.
+    if (SharedGC::isMarked(cell))
+      return false;
+    SharedGC::setCellMarkBit(cell);
+    gc_.markState_->localWorklist.push(cell);
+    return true;
+  }
+
+ private:
+  SharedGC &gc_;
+};
+
+void SharedGC::beginCycle() {
+  assert(!markState_ && "a marking cycle is already in progress");
+  markState_.emplace();
+}
+
+void SharedGC::endCycle() {
+  assert(markState_ && "no marking cycle in progress");
+  assert(markState_->localWorklist.empty() && "cells were left untraced");
+  markState_.reset();
+}
+
+void SharedGC::markRoots(llvh::ArrayRef<SharedGCCell *> roots) {
+  assert(markState_ && "no marking cycle in progress");
+  MarkAcceptor acceptor(*this);
+  for (SharedGCCell *root : roots)
+    acceptor.accept(root);
+}
+
+size_t SharedGC::drainMarkWorklist() {
+  assert(markState_ && "no marking cycle in progress");
+  MarkAcceptor acceptor(*this);
+  auto &localWorklist = markState_->localWorklist;
+  size_t traced = 0;
+  while (!localWorklist.empty()) {
+    // Pop before visiting, not after: markCell pushes onto this same stack,
+    // so a later pop would discard a newly found cell instead of this one.
+    SharedGCCell *cell = localWorklist.top();
+    localWorklist.pop();
+    markCell(acceptor, cell);
+    ++traced;
+  }
+  return traced;
 }
 
 } // namespace vm

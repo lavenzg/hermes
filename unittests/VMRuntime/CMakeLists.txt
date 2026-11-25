@@ -88,6 +88,7 @@ if(HERMES_ENABLE_SHARED_HEAP)
     SharedGCBoxingTest.cpp
     SharedGCCellTest.cpp
     SharedGCTest.cpp
+    SharedMarkAcceptorTest.cpp
     SharedObjectBoxMapTest.cpp
     SharedSlotVisitorTest.cpp
     )
