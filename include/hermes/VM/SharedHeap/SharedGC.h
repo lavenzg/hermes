@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -29,6 +31,7 @@
 #include <mutex>
 #include <new>
 #include <stack>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -142,6 +145,21 @@ class SharedGC {
           ((size - 1) >> (k - kLogNumGroup)) & (kNumGroup - 1);
       return kNumPreciseBuckets + (k - kLogPreciseCutoff) * kNumGroup + offset;
     }
+  };
+
+  /// When the collector thread starts a cycle.
+  struct CollectorConfig {
+    /// How far the footprint grows, in mapped bytes, past what the last sweep
+    /// left before the footprint alone makes a cycle due: less if half the
+    /// remaining budget is less.
+    size_t minTriggerBytes = size_t{4} << 20;
+    /// The least time from the end of one cycle to the start of the next.
+    /// The gap is also at least as long as the last cycle took, which keeps
+    /// the collector busy at most half the time. Capped at a year.
+    std::chrono::milliseconds minGap{100};
+    /// The longest a group that keeps changing goes between cycles. Capped
+    /// at a year.
+    std::chrono::milliseconds maxGap{30000};
   };
 
  private:
@@ -440,6 +458,23 @@ class SharedGC {
     std::vector<std::pair<const SharedMutator *, uint32_t>> awaited;
   };
 
+  /// \param config when the collector thread runs a cycle.
+  /// \param startCollector whether there is a collector thread.
+  SharedGC(size_t maxSize, const CollectorConfig &config, bool startCollector);
+
+  /// \return the footprint at which the next cycle is due, after a sweep that
+  ///   left \p footprint: twice that, or that plus minTriggerBytes if more,
+  ///   but no more than halfway from it to the budget. If that allows no
+  ///   growth, SIZE_MAX: the footprint never makes a cycle due.
+  size_t nextTriggerBytes(size_t footprint) const;
+
+  /// Have the collector thread look again at whether a cycle is due. Does
+  /// nothing without one.
+  void wakeCollector();
+
+  /// The collector thread's body.
+  void runCollector();
+
   //===--------------------------------------------------------------------===//
   // State
 
@@ -502,6 +537,44 @@ class SharedGC {
   /// walk it, never a store. It also keeps SharedMutator incomplete here.
   std::vector<SharedMutator *> mutators_;
 
+  /// Held by collect() for the whole cycle, so callers -- the collector thread
+  /// among them -- take turns. Taken before every other lock here.
+  std::mutex cycleMtx_;
+
+  /// Bumped at the end of every collect().
+  std::atomic<uint64_t> cycleCount_{0};
+
+  /// The footprint at which createRegion wakes the collector thread, set by
+  /// collect() after its sweep, by nextTriggerBytes.
+  std::atomic<size_t> triggerBytes_{std::numeric_limits<size_t>::max()};
+
+  /// Set when the budget refuses a reservation or a mapping fails, and cleared
+  /// when a cycle begins. While set, a cycle is due.
+  std::atomic<bool> starved_{false};
+
+  /// Set by the first allocation, or the first runtime to leave, after a cycle
+  /// begins, and cleared when the next one begins. While set, a cycle is due
+  /// once maxGap has passed since the last one ended.
+  std::atomic<bool> changedSinceCycle_{false};
+
+  /// When the collector thread starts a cycle.
+  const CollectorConfig collectorConfig_;
+
+  /// Whether this heap has a collector thread.
+  const bool hasCollector_;
+
+  /// What the collector thread sleeps on, and the guard for stopCollector_.
+  /// Taken under mtx_ or barrierMtx_ to wake the thread, which never holds it
+  /// while collecting, so nothing is ever taken after it.
+  std::mutex collectorMtx_;
+  std::condition_variable collectorCv_;
+  /// Set by the destructor to stop the collector thread.
+  bool stopCollector_{false};
+
+  /// The collector thread, if there is one. Started at the end of the
+  /// constructor, once every member is built.
+  std::thread collectorThread_;
+
 #ifndef NDEBUG
   /// Shared across the group: GCBase::nextObjectID is per-Runtime and would
   /// hand the same id to cells in different Runtimes.
@@ -535,9 +608,16 @@ class SharedGC {
 
   /// \param maxSize the group-wide budget in mapped bytes.
   explicit SharedGC(size_t maxSize);
-  /// Frees every cell left. No runtime is attached by now, so nothing is a
-  /// root, and one more collect() finds every cell unreachable.
-  /// \pre no runtime is attached, and no cycle is in progress.
+  /// Also start a collector thread, which runs collect() whenever \p
+  /// collector says a cycle is due. Do not drive cycles step by step on such
+  /// a heap; only collect() takes turns with the thread.
+  SharedGC(size_t maxSize, const CollectorConfig &collector);
+  /// Stops the collector thread, if there is one, which finishes any cycle it
+  /// is running. Then frees every cell left: no runtime is attached by now,
+  /// so nothing is a root, and one more collect() finds every cell
+  /// unreachable.
+  /// \pre no runtime is attached, and no cycle driven step by step is in
+  ///   progress.
   ~SharedGC();
 
   SharedGC(const SharedGC &) = delete;
@@ -655,8 +735,12 @@ class SharedGC {
   /// needs nothing from the runtimes: an idle one is not waited for, and a busy
   /// one only until its current barrier ends.
   ///
-  /// \pre no cycle is in progress, nothing else is sweeping, and the calling
-  ///   thread is not inside a barrier window, which the wait would wait for.
+  /// Holds cycleMtx_ throughout, so callers -- the collector thread among
+  /// them -- take turns.
+  ///
+  /// \pre no cycle or sweep driven step by step is in progress, and the
+  ///   calling thread holds no lock here or in a runtime and is not inside a
+  ///   barrier window, which the wait would wait for.
   size_t collect();
 
   //===--------------------------------------------------------------------===//
@@ -976,6 +1060,16 @@ class SharedGC {
     for (const SegmentHeader &hdr : largeRegions_)
       n += hdr.liveCells;
     return n;
+  }
+
+  /// \return how many times collect() has finished.
+  uint64_t cycleCountSlow() const {
+    return cycleCount_.load(std::memory_order_acquire);
+  }
+
+  /// \return the footprint at which the collector thread is next woken.
+  size_t triggerBytesSlow() const {
+    return triggerBytes_.load(std::memory_order_relaxed);
   }
 
   /// \return the number of mapped regions. Walks every region.

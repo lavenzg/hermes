@@ -24,7 +24,29 @@
 namespace hermes {
 namespace vm {
 
-SharedGC::SharedGC(size_t maxSize) : maxSize_(maxSize) {
+SharedGC::SharedGC(size_t maxSize)
+    : SharedGC(maxSize, CollectorConfig{}, /*startCollector*/ false) {}
+
+SharedGC::SharedGC(size_t maxSize, const CollectorConfig &collector)
+    : SharedGC(maxSize, collector, /*startCollector*/ true) {}
+
+/// \return \p config with each gap capped at a year, so that a deadline
+///   computed from it cannot overflow steady_clock.
+static SharedGC::CollectorConfig withCappedGaps(
+    SharedGC::CollectorConfig config) {
+  constexpr std::chrono::milliseconds kYear = std::chrono::hours(24 * 365);
+  config.minGap = std::min(config.minGap, kYear);
+  config.maxGap = std::min(config.maxGap, kYear);
+  return config;
+}
+
+SharedGC::SharedGC(
+    size_t maxSize,
+    const CollectorConfig &config,
+    bool startCollector)
+    : maxSize_(maxSize),
+      collectorConfig_(withCappedGaps(config)),
+      hasCollector_(startCollector) {
   // Checked once here rather than on every region: vm_allocate_aligned asserts
   // both the size and the alignment against the OS page size, so a segment
   // smaller than a page cannot be mapped at all on a 64 KiB-page kernel. In
@@ -34,9 +56,21 @@ SharedGC::SharedGC(size_t maxSize) : maxSize_(maxSize) {
       kSegmentSize % oscompat::page_size() == 0 &&
       "kSegmentSize must be a multiple of OS pages, or vm_allocate_aligned "
       "cannot honour the request");
+  triggerBytes_.store(nextTriggerBytes(0), std::memory_order_relaxed);
+  if (hasCollector_)
+    collectorThread_ = std::thread([this] { runCollector(); });
 }
 
 SharedGC::~SharedGC() {
+  if (hasCollector_) {
+    {
+      std::lock_guard<std::mutex> lk(collectorMtx_);
+      stopCollector_ = true;
+    }
+    collectorCv_.notify_one();
+    collectorThread_.join();
+  }
+
   // A surviving registration means a Runtime outlived the heap it attached to.
   // Its ~SharedMutator would lock a freed mutex and write a freed vector, and
   // ASan would report the mutex rather than the ownership bug.
@@ -85,15 +119,27 @@ SharedGC::Segment *SharedGC::createRegion(
 
   size_t cur = footprint_.load(std::memory_order_relaxed);
   do {
-    if (LLVM_UNLIKELY(bytes > maxSize_ - cur))
+    if (LLVM_UNLIKELY(bytes > maxSize_ - cur)) {
+      // A cycle may free enough for the caller's next attempt. Only the first
+      // refusal since a cycle began wakes the thread; the rest find it due.
+      if (!starved_.exchange(true, std::memory_order_relaxed))
+        wakeCollector();
       return nullptr;
+    }
   } while (!footprint_.compare_exchange_weak(
       cur, cur + bytes, std::memory_order_relaxed, std::memory_order_relaxed));
+  // Only the reservation that crosses the trigger wakes the thread. After a
+  // cycle, the thread itself checks a footprint already past the new one.
+  const size_t trigger = triggerBytes_.load(std::memory_order_relaxed);
+  if (cur < trigger && cur + bytes >= trigger)
+    wakeCollector();
 
   auto res = oscompat::vm_allocate_aligned(bytes, kSegmentSize);
   if (LLVM_UNLIKELY(!res)) {
     // Restore the footprint.
     footprint_.fetch_sub(bytes, std::memory_order_relaxed);
+    if (!starved_.exchange(true, std::memory_order_relaxed))
+      wakeCollector();
     return nullptr;
   }
   oscompat::vm_name(*res, bytes, "hermes-shared");
@@ -132,6 +178,13 @@ void *SharedGC::finishAlloc(SegmentHeader *hdr, uint32_t i) {
   hdr->allocBits.set(i, true);
   ++hdr->liveCells;
   hdr->nextFreeHint = i + 1;
+
+  // The first allocation since a cycle began turns on the collector thread's
+  // time-based trigger. Under mtx_, so a load and a store do.
+  if (LLVM_UNLIKELY(!changedSinceCycle_.load(std::memory_order_relaxed))) {
+    changedSinceCycle_.store(true, std::memory_order_relaxed);
+    wakeCollector();
+  }
 
   // Black allocation, and unconditional for a reason stronger than "harmless".
   // A cell born between certification and the following sweep must be marked
@@ -460,6 +513,15 @@ void SharedGC::beginCycle() {
   // as a raw pointer on a C++ stack across a cycle boundary is not covered by
   // it. Not reachable while only tests start a cycle.
   std::unique_lock<std::mutex> allocLk(mtx_);
+  // Cleared under mtx_, before marking turns on. A refusal or a first
+  // allocation, also under mtx_, either comes before this, and this cycle
+  // covers it, or after, and makes the next one due. A runtime that leaves
+  // holds only barrierMtx_. If it finds marking on, or the root scan still
+  // finds it, it sets changedSinceCycle_ after this and makes the next cycle
+  // due, since this one keeps what it named; if it leaves earlier, this cycle
+  // covers it.
+  starved_.store(false, std::memory_order_relaxed);
+  changedSinceCycle_.store(false, std::memory_order_relaxed);
   whitenAllLocked();
   cycleSeq_.fetch_add(1, std::memory_order_seq_cst);
   assert(markingOn() && "beginCycle must leave marking on");
@@ -594,6 +656,7 @@ void SharedGC::markRoots(llvh::ArrayRef<SharedGCCell *> roots) {
 }
 
 size_t SharedGC::collect() {
+  std::lock_guard<std::mutex> cycleLock(cycleMtx_);
   beginCycle();
 
   // A wait lasts one barrier unless a runtime is descheduled inside it, so
@@ -621,7 +684,82 @@ size_t SharedGC::collect() {
   assert(dangling == 0 && "a box-map key names a cell the sweep freed");
   (void)dangling;
 #endif
+  triggerBytes_.store(
+      nextTriggerBytes(footprint_.load(std::memory_order_relaxed)),
+      std::memory_order_relaxed);
+  cycleCount_.fetch_add(1, std::memory_order_release);
   return released;
+}
+
+size_t SharedGC::nextTriggerBytes(size_t footprint) const {
+  // In 64 bits, so that doubling cannot wrap on a 32-bit host, and the sum
+  // saturates, so that a huge minTriggerBytes cannot wrap on a 64-bit one.
+  const uint64_t left = footprint;
+  const uint64_t minGrowth = collectorConfig_.minTriggerBytes;
+  const uint64_t grown = std::max(
+      left * 2, minGrowth > UINT64_MAX - left ? UINT64_MAX : left + minGrowth);
+  const uint64_t halfway = left + (maxSize_ - left) / 2;
+  const uint64_t trigger = std::min(grown, halfway);
+  // A trigger the footprint already meets would keep a cycle due, and the
+  // thread would collect back to back while nothing happens. That is a full
+  // heap, or an empty one with a minTriggerBytes of 0.
+  if (trigger <= left)
+    return std::numeric_limits<size_t>::max();
+  return static_cast<size_t>(trigger);
+}
+
+void SharedGC::wakeCollector() {
+  if (!hasCollector_)
+    return;
+  // The lock, though it guards nothing here, is what keeps this wake from
+  // falling between the thread's look at the state and its sleep.
+  {
+    std::lock_guard<std::mutex> lk(collectorMtx_);
+  }
+  collectorCv_.notify_one();
+}
+
+void SharedGC::runCollector() {
+  oscompat::set_thread_name("hermes-sharedgc");
+  using Clock = std::chrono::steady_clock;
+  // Both clocks start with the thread: a cycle may start at once, and the
+  // time-based trigger measures from here until the first cycle ends.
+  Clock::time_point lastEnd = Clock::now();
+  Clock::time_point earliest = lastEnd;
+  std::unique_lock<std::mutex> lk(collectorMtx_);
+  for (;;) {
+    if (stopCollector_)
+      return;
+    const Clock::time_point now = Clock::now();
+    const bool changed = changedSinceCycle_.load(std::memory_order_relaxed);
+    const bool due = footprint_.load(std::memory_order_relaxed) >=
+            triggerBytes_.load(std::memory_order_relaxed) ||
+        starved_.load(std::memory_order_relaxed) ||
+        (changed && now - lastEnd >= collectorConfig_.maxGap);
+    if (!due) {
+      // With nothing changed since the last cycle there is no time to wake
+      // at; only an allocation, a runtime leaving, or the destructor wakes the
+      // thread.
+      if (changed)
+        collectorCv_.wait_until(lk, lastEnd + collectorConfig_.maxGap);
+      else
+        collectorCv_.wait(lk);
+      continue;
+    }
+    if (now < earliest) {
+      // Due already, so only the destructor cuts the gap short.
+      collectorCv_.wait_until(lk, earliest, [this] { return stopCollector_; });
+      continue;
+    }
+    lk.unlock();
+    const Clock::time_point start = Clock::now();
+    collect();
+    const Clock::time_point end = Clock::now();
+    lk.lock();
+    lastEnd = end;
+    earliest =
+        end + std::max<Clock::duration>(collectorConfig_.minGap, end - start);
+  }
 }
 
 bool SharedGC::pollInFlightBarriers() {
@@ -864,6 +1002,11 @@ void SharedGC::unlinkMutator(
   // Order does not matter: no walk depends on it.
   *it = mutators_.back();
   mutators_.pop_back();
+
+  // The cells only this runtime named are garbage now. Turning on the
+  // time-based trigger lets a group in which nothing else happens reclaim them.
+  if (!changedSinceCycle_.exchange(true, std::memory_order_relaxed))
+    wakeCollector();
 }
 
 void SharedGC::spill(SharedMutator &mutator) {
